@@ -1,0 +1,4 @@
+[submodule "FEX"]
+	path = FEX
+	url = https://github.com/willfaust/FEX.git
+	branch = ios-port

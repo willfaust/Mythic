@@ -1,0 +1,27 @@
+# Reference repos (not part of the project, just for research)
+box64/
+LiveContainer/
+MeloNX/
+research/
+
+# Build artifacts
+app/build/
+app/DerivedData/
+FEX/build-ios/
+
+# Xcode
+*.xcuserdata
+*.xcworkspace
+xcuserdata/
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Console/crash logs (large, device-specific)
+console-log.txt
+crash-log,txt
+
+# StikDebug scripts (reference only)
+MeloNX.js

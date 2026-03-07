@@ -1,0 +1,382 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A1000001 /* MythicApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000001; };
+		A1000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000002; };
+		A1000003 /* LogStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000003; };
+		A1000004 /* JITAllocator.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000004; };
+		A1000005 /* EntitlementChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200000A; };
+		A1000006 /* FEXBridge.mm in Sources */ = {isa = PBXBuildFile; fileRef = A200000B; };
+		A1000010 /* libFEXCore.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000010; };
+		A1000011 /* libFEXCore_Base.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000011; };
+		A1000012 /* libfmt.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000012; };
+		A1000013 /* libcephes_128bit.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000013; };
+		A1000014 /* libxxhash.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000014; };
+		A1000015 /* libsoftfloat_3e.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000015; };
+		A1000016 /* libc++.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000016; };
+		A1000017 /* libJemallocLibs.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000017; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A2000001 /* MythicApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MythicApp.swift; sourceTree = "<group>"; };
+		A2000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		A2000003 /* LogStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogStore.swift; sourceTree = "<group>"; };
+		A2000004 /* JITAllocator.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = JITAllocator.c; sourceTree = "<group>"; };
+		A2000005 /* JITAllocator.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = JITAllocator.h; sourceTree = "<group>"; };
+		A2000006 /* Mythic-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Mythic-Bridging-Header.h"; sourceTree = "<group>"; };
+		A2000007 /* Mythic.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Mythic.entitlements; sourceTree = "<group>"; };
+		A2000008 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A2000009 /* Mythic.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Mythic.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A200000A /* EntitlementChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EntitlementChecker.swift; sourceTree = "<group>"; };
+		A200000B /* FEXBridge.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = FEXBridge.mm; sourceTree = "<group>"; };
+		A200000C /* FEXBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = FEXBridge.h; sourceTree = "<group>"; };
+		A2000010 /* libFEXCore.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libFEXCore.a; path = "../../FEX/build-ios/FEXCore/Source/libFEXCore.a"; sourceTree = "<group>"; };
+		A2000011 /* libFEXCore_Base.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libFEXCore_Base.a; path = "../../FEX/build-ios/FEXCore/Source/libFEXCore_Base.a"; sourceTree = "<group>"; };
+		A2000012 /* libfmt.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libfmt.a; path = "../../FEX/build-ios/External/fmt/libfmt.a"; sourceTree = "<group>"; };
+		A2000013 /* libcephes_128bit.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libcephes_128bit.a; path = "../../FEX/build-ios/External/cephes/libcephes_128bit.a"; sourceTree = "<group>"; };
+		A2000014 /* libxxhash.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libxxhash.a; path = "../../FEX/build-ios/External/xxhash/cmake_unofficial/libxxhash.a"; sourceTree = "<group>"; };
+		A2000015 /* libsoftfloat_3e.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libsoftfloat_3e.a; path = "../../FEX/build-ios/External/SoftFloat-3e/libsoftfloat_3e.a"; sourceTree = "<group>"; };
+		A2000016 /* libc++.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = "libc++.tbd"; path = "usr/lib/libc++.tbd"; sourceTree = SDKROOT; };
+		A2000017 /* libJemallocLibs.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libJemallocLibs.a; path = "../../FEX/build-ios/FEXCore/Source/libJemallocLibs.a"; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A3000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1000010 /* libFEXCore.a in Frameworks */,
+				A1000011 /* libFEXCore_Base.a in Frameworks */,
+				A1000012 /* libfmt.a in Frameworks */,
+				A1000013 /* libcephes_128bit.a in Frameworks */,
+				A1000014 /* libxxhash.a in Frameworks */,
+				A1000015 /* libsoftfloat_3e.a in Frameworks */,
+				A1000016 /* libc++.tbd in Frameworks */,
+				A1000017 /* libJemallocLibs.a in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A4000001 = {
+			isa = PBXGroup;
+			children = (
+				A4000002 /* Mythic */,
+				A4000004 /* Libraries */,
+				A4000003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A4000002 /* Mythic */ = {
+			isa = PBXGroup;
+			children = (
+				A2000001 /* MythicApp.swift */,
+				A2000002 /* ContentView.swift */,
+				A2000003 /* LogStore.swift */,
+				A2000004 /* JITAllocator.c */,
+				A2000005 /* JITAllocator.h */,
+				A200000B /* FEXBridge.mm */,
+				A200000C /* FEXBridge.h */,
+				A200000A /* EntitlementChecker.swift */,
+				A2000006 /* Mythic-Bridging-Header.h */,
+				A2000007 /* Mythic.entitlements */,
+				A2000008 /* Info.plist */,
+			);
+			path = Mythic;
+			sourceTree = "<group>";
+		};
+		A4000003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A2000009 /* Mythic.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		A4000004 /* Libraries */ = {
+			isa = PBXGroup;
+			children = (
+				A2000010 /* libFEXCore.a */,
+				A2000011 /* libFEXCore_Base.a */,
+				A2000012 /* libfmt.a */,
+				A2000013 /* libcephes_128bit.a */,
+				A2000014 /* libxxhash.a */,
+				A2000015 /* libsoftfloat_3e.a */,
+				A2000016 /* libc++.tbd */,
+				A2000017 /* libJemallocLibs.a */,
+			);
+			name = Libraries;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A5000001 /* Mythic */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A7000003 /* Build configuration list for PBXNativeTarget "Mythic" */;
+			buildPhases = (
+				A3000002 /* Sources */,
+				A3000001 /* Frameworks */,
+				A3000003 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Mythic;
+			productName = Mythic;
+			productReference = A2000009 /* Mythic.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A6000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					A5000001 = {
+						CreatedOnToolsVersion = 16.0;
+					};
+				};
+			};
+			buildConfigurationList = A7000001 /* Build configuration list for PBXProject "Mythic" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A4000001;
+			productRefGroup = A4000003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A5000001 /* Mythic */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A3000003 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A3000002 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1000001 /* MythicApp.swift in Sources */,
+				A1000002 /* ContentView.swift in Sources */,
+				A1000003 /* LogStore.swift in Sources */,
+				A1000004 /* JITAllocator.c in Sources */,
+				A1000005 /* EntitlementChecker.swift in Sources */,
+				A1000006 /* FEXBridge.mm in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A8000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) DEBUG";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		A8000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		A8000003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Mythic/Mythic.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = UT49TA9TA4;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/../FEX/FEXCore/include",
+					"$(SRCROOT)/../FEX/FEXHeaderUtils",
+					"$(SRCROOT)/../FEX/CodeEmitter",
+					"$(SRCROOT)/../FEX/External/fmt/include",
+					"$(SRCROOT)/../FEX/External/range-v3/include",
+					"$(SRCROOT)/../FEX/External/unordered_dense/include",
+					"$(SRCROOT)/../FEX/build-ios",
+					"$(SRCROOT)/../FEX/build-ios/include",
+					"$(SRCROOT)/../FEX/build-ios/FEXCore/Source",
+					"$(SRCROOT)/../FEX",
+				);
+				INFOPLIST_FILE = Mythic/Info.plist;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/../FEX/build-ios/FEXCore/Source",
+					"$(SRCROOT)/../FEX/build-ios/External/fmt",
+					"$(SRCROOT)/../FEX/build-ios/External/cephes",
+					"$(SRCROOT)/../FEX/build-ios/External/xxhash/cmake_unofficial",
+					"$(SRCROOT)/../FEX/build-ios/External/SoftFloat-3e",
+				);
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.mythic.emulator;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "Mythic/Mythic-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A8000004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Mythic/Mythic.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = UT49TA9TA4;
+				GENERATE_INFOPLIST_FILE = NO;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/../FEX/FEXCore/include",
+					"$(SRCROOT)/../FEX/FEXHeaderUtils",
+					"$(SRCROOT)/../FEX/CodeEmitter",
+					"$(SRCROOT)/../FEX/External/fmt/include",
+					"$(SRCROOT)/../FEX/External/range-v3/include",
+					"$(SRCROOT)/../FEX/External/unordered_dense/include",
+					"$(SRCROOT)/../FEX/build-ios",
+					"$(SRCROOT)/../FEX/build-ios/include",
+					"$(SRCROOT)/../FEX/build-ios/FEXCore/Source",
+					"$(SRCROOT)/../FEX",
+				);
+				INFOPLIST_FILE = Mythic/Info.plist;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/../FEX/build-ios/FEXCore/Source",
+					"$(SRCROOT)/../FEX/build-ios/External/fmt",
+					"$(SRCROOT)/../FEX/build-ios/External/cephes",
+					"$(SRCROOT)/../FEX/build-ios/External/xxhash/cmake_unofficial",
+					"$(SRCROOT)/../FEX/build-ios/External/SoftFloat-3e",
+				);
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.mythic.emulator;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "Mythic/Mythic-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A7000001 /* Build configuration list for PBXProject "Mythic" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A8000001 /* Debug */,
+				A8000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A7000003 /* Build configuration list for PBXNativeTarget "Mythic" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A8000003 /* Debug */,
+				A8000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+	};
+	rootObject = A6000001 /* Project object */;
+}

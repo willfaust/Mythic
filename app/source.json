@@ -1,0 +1,33 @@
+{
+  "name": "Mythic",
+  "identifier": "com.mythic.emulator",
+  "apps": [
+    {
+      "name": "Mythic",
+      "bundleIdentifier": "com.mythic.emulator",
+      "developerName": "Mythic Team",
+      "version": "0.1.0",
+      "versionDate": "2026-03-07",
+      "versionDescription": "Initial release with JIT allocator, dual-mapped memory testing, and entitlement detection.",
+      "downloadURL": "",
+      "localizedDescription": "x86 Windows game emulation layer for iOS using FEX-Emu, Wine, and Metal graphics translation.",
+      "iconURL": "",
+      "tintColor": "7B68EE",
+      "size": 0,
+      "minOSVersion": "17.0",
+      "appPermissions": {
+        "entitlements": [
+          {
+            "name": "com.apple.security.cs.allow-jit"
+          },
+          {
+            "name": "com.apple.developer.kernel.increased-memory-limit"
+          },
+          {
+            "name": "com.apple.developer.kernel.extended-virtual-addressing"
+          }
+        ]
+      }
+    }
+  ]
+}
