@@ -227,6 +227,11 @@ public:
             int fd = static_cast<int>(Args->Argument[1]);
             auto buf = reinterpret_cast<const char*>(Args->Argument[2]);
             size_t count = Args->Argument[3];
+
+            // NOTE: On non-Windows, syscall does NOT have FLAGS_BLOCK_END.
+            // The JIT-compiled block continues past the syscall instruction.
+            // Do NOT modify Frame->State.rip here — the JIT handles continuation.
+
             if (fd == 1 || fd == 2) {
                 // stdout/stderr
                 fex_log("[x86 write fd=%d] %.*s", fd, (int)count, buf);
@@ -254,6 +259,8 @@ public:
         }
         default:
             fex_log("[x86] Unhandled syscall %llu", SyscallNum);
+            // Do NOT modify rip — syscall is non-block-ending on non-Windows,
+            // so the JIT continues past it inline.
             return -38; // ENOSYS
         }
     }
@@ -544,14 +551,79 @@ int64_t fex_test_execute(void) {
     uint64_t code_addr = reinterpret_cast<uint64_t>(guest_mem);
     uint64_t stack_addr = code_addr + 0x80000 + GUEST_STACK_SIZE; // Top of stack
 
-    // Write x86-64 code: mov eax, 42; syscall(exit, 42)
-    // Using exit syscall so the execution terminates cleanly
+    // x86-64 test: Recursive Fibonacci
+    //
+    // int fib(int n) {
+    //     if (n <= 1) return n;
+    //     return fib(n-1) + fib(n-2);
+    // }
+    // exit(fib(10));  // fib(10) = 55
+    //
+    // _start:
+    //   +00: mov edi, 10           ; n = 10
+    //   +05: call fib              ; call fib(10)
+    //   +0A: mov edi, eax          ; exit code = result
+    //   +0C: mov eax, 60           ; sys_exit
+    //   +11: syscall
+    //
+    // fib:
+    //   +13: push rbp
+    //   +14: mov rbp, rsp
+    //   +17: push rbx              ; save rbx (callee-saved)
+    //   +18: sub rsp, 8            ; align stack to 16 bytes
+    //   +1C: mov ebx, edi          ; ebx = n
+    //   +1E: cmp edi, 1
+    //   +21: jle .base_case
+    //   +23: lea edi, [rbx-1]      ; edi = n-1
+    //   +26: call fib              ; eax = fib(n-1)
+    //   +2B: mov r12d, eax         ; save fib(n-1) — wait, r12 might not be saved
+    //        Actually, let's use the stack to save fib(n-1):
+    //   +2B: push rax              ; save fib(n-1) on stack
+    //   +2C: lea edi, [rbx-2]      ; edi = n-2
+    //   +2F: call fib              ; eax = fib(n-2)
+    //   +34: pop rbx               ; rbx = fib(n-1) (reuse rbx since we're done with n)
+    //   +35: add eax, ebx          ; eax = fib(n-1) + fib(n-2)
+    //   +37: jmp .epilog
+    // .base_case:
+    //   +39: mov eax, ebx          ; return n (0 or 1)
+    // .epilog:
+    //   +3B: add rsp, 8            ; undo sub rsp,8
+    //   +3F: pop rbx               ; restore rbx
+    //   +40: pop rbp
+    //   +41: ret
+    //
     uint8_t x86_code[] = {
-        0xB8, 0x2A, 0x00, 0x00, 0x00,  // mov eax, 42
-        0x48, 0x89, 0xC7,              // mov rdi, rax  (exit code = 42)
-        0xB8, 0x3C, 0x00, 0x00, 0x00,  // mov eax, 60   (sys_exit)
-        0x0F, 0x05,                     // syscall
+        // _start:
+        0xBF, 0x0A, 0x00, 0x00, 0x00,              // +00: mov edi, 10
+        0xE8, 0x09, 0x00, 0x00, 0x00,              // +05: call fib (+13)  rel32=0x13-(0x05+5)=0x09
+        0x89, 0xC7,                                 // +0A: mov edi, eax
+        0xB8, 0x3C, 0x00, 0x00, 0x00,              // +0C: mov eax, 60
+        0x0F, 0x05,                                 // +11: syscall (exit)
+        // fib:
+        0x55,                                       // +13: push rbp
+        0x48, 0x89, 0xE5,                           // +14: mov rbp, rsp
+        0x53,                                       // +17: push rbx
+        0x48, 0x83, 0xEC, 0x08,                     // +18: sub rsp, 8
+        0x89, 0xFB,                                 // +1C: mov ebx, edi
+        0x83, 0xFF, 0x01,                           // +1E: cmp edi, 1
+        0x7E, 0x16,                                 // +21: jle .base_case (+39)  rel8=0x39-(0x21+2)=0x16
+        0x8D, 0x7B, 0xFF,                           // +23: lea edi, [rbx-1]
+        0xE8, 0xE8, 0xFF, 0xFF, 0xFF,              // +26: call fib (+13)  rel32=0x13-0x2B=0xFFFFFFE8
+        0x50,                                       // +2B: push rax   (save fib(n-1))
+        0x8D, 0x7B, 0xFE,                           // +2C: lea edi, [rbx-2]
+        0xE8, 0xDF, 0xFF, 0xFF, 0xFF,              // +2F: call fib (+13)  rel32=0x13-(0x2F+5)=0xFFFFFFDF
+        0x5B,                                       // +34: pop rbx   (rbx = fib(n-1))
+        0x01, 0xD8,                                 // +35: add eax, ebx
+        0xEB, 0x02,                                 // +37: jmp .epilog (+3B)  rel8=0x3B-(0x37+2)=0x02
+        // .base_case:
+        0x89, 0xD8,                                 // +39: mov eax, ebx
+        // .epilog:
+        0x48, 0x83, 0xC4, 0x08,                     // +3B: add rsp, 8
+        0x5B,                                       // +3F: pop rbx
+        0x5D,                                       // +40: pop rbp
+        0xC3,                                       // +41: ret
     };
+    const int64_t EXPECTED_EXIT = 55;  // fib(10) = 55
 
     memcpy(reinterpret_cast<void*>(code_addr), x86_code, sizeof(x86_code));
     fex_log("Wrote %zu bytes of x86-64 code at 0x%llx", sizeof(x86_code), (unsigned long long)code_addr);
@@ -572,6 +644,36 @@ int64_t fex_test_execute(void) {
         ::munmap(guest_mem, 0x100000);
         running.store(false);
         return -1;
+    }
+
+    // Allocate call-ret shadow stack (needed for call/ret instructions).
+    // On Linux this is done by LinuxEmulation/ThreadManager; on iOS we do it here.
+    {
+        constexpr size_t CALLRET_STACK_SIZE = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE; // 4MB
+        constexpr size_t PAGE_SIZE = 0x4000; // 16KB iOS pages
+        constexpr size_t ALLOC_SIZE = CALLRET_STACK_SIZE + 2 * PAGE_SIZE; // guard pages on both sides
+
+        void *callret_alloc = ::mmap(nullptr, ALLOC_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (callret_alloc == MAP_FAILED) {
+            fex_log("FAIL: Could not allocate call-ret stack");
+            g_ctx->DestroyThread(Thread);
+            ::munmap(guest_mem, 0x100000);
+            running.store(false);
+            return -1;
+        }
+
+        // The usable area is between the two guard pages
+        void *callret_base = static_cast<uint8_t*>(callret_alloc) + PAGE_SIZE;
+        ::mprotect(callret_base, CALLRET_STACK_SIZE, PROT_READ | PROT_WRITE);
+
+        Thread->CallRetStackBase = callret_base;
+        // Start at 1/4 into the stack (allows underflow room, like Linux does)
+        Thread->CurrentFrame->State.callret_sp =
+            reinterpret_cast<uint64_t>(callret_base) + CALLRET_STACK_SIZE / 4;
+
+        fex_log("Call-ret stack: alloc=%p, base=%p, sp=0x%llx",
+                callret_alloc, callret_base,
+                (unsigned long long)Thread->CurrentFrame->State.callret_sp);
     }
 
     // Initialize GDT segment table for 64-bit long mode.
@@ -612,42 +714,14 @@ int64_t fex_test_execute(void) {
     fex_log("JIT pool: RX=%p, RW=%p, size=%zu, used=%zu",
             g_jit_rx_base, g_jit_rw_base, g_jit_pool_size, g_jit_pool_offset.load());
 
-    // Pre-compile the block to verify compilation works
-    fex_log("=== Pre-compiling block at RIP=0x%llx ===", (unsigned long long)code_addr);
-    size_t jit_used_before = g_jit_pool_offset.load();
-    g_ctx->CompileRIPCount(Thread, code_addr, 4);
-    size_t jit_used_after = g_jit_pool_offset.load();
-    fex_log("JIT pool used: before=%zu, after=%zu, delta=%zu",
-            jit_used_before, jit_used_after, jit_used_after - jit_used_before);
+    // Skip pre-compilation — let the dispatcher compile the full block at runtime.
+    // CompileRIPCount with MaxInst=4 creates a truncated block that poisons the cache.
+    fex_log("Skipping pre-compilation, dispatcher will compile on first execution");
 
-    // Dump ALL compiled code (RW view - RX is execute-only on TXM)
-    {
-        uint32_t *rw_buf = reinterpret_cast<uint32_t*>(
-            static_cast<uint8_t*>(g_jit_rw_base) + 16384);
-        int total_words = 556 / 4; // 139 words for 556 bytes
-
-        fex_log("=== Full compiled block (%d words) ===", total_words);
-        for (int i = 0; i < total_words; i++) {
-            fex_log("  CB[%3d] +%04x: 0x%08x", i, i*4, rw_buf[i]);
-        }
-        fex_log("=== End compiled block ===");
-    }
-
-    // Check L2 cache entry manually
+    // L2 cache and Dispatcher logging
     {
         auto l2ptr = Thread->CurrentFrame->Pointers.L2Pointer;
         fex_log("L2Pointer = %p", (void*)l2ptr);
-        uintptr_t expected = reinterpret_cast<uintptr_t>(g_jit_rx_base) + 16384 + 4;
-        fex_log("Expected HostCode = %p (RX base + 16384 + 4)", (void*)expected);
-    }
-
-    // Also dump first 40 words of Dispatcher code for reference
-    {
-        uint32_t *disp_rw = reinterpret_cast<uint32_t*>(g_jit_rw_base);
-        fex_log("=== Dispatcher code (first 40 words) ===");
-        for (int i = 0; i < 40; i++) {
-            fex_log("  DISP[%2d] +%04x: 0x%08x", i, i*4, disp_rw[i]);
-        }
     }
 
     // Check Pointers struct
@@ -669,15 +743,19 @@ int64_t fex_test_execute(void) {
     std::atomic<bool> execution_done{false};
     auto *WatchThread = Thread;
     std::thread watchdog([&execution_done, WatchThread]() {
-        for (int i = 1; i <= 5; i++) {
+        for (int i = 1; i <= 10; i++) {
             usleep(500000);
             if (execution_done.load()) return;
-            fex_log("WATCHDOG: %dms RIP=0x%llx syscalls=%d",
+            auto &st = WatchThread->CurrentFrame->State;
+            fex_log("WATCHDOG: %dms RIP=0x%llx RSP=0x%llx RAX=%lld RDI=%lld syscalls=%d",
                     i * 500,
-                    (unsigned long long)WatchThread->CurrentFrame->State.rip,
+                    (unsigned long long)st.rip,
+                    (unsigned long long)st.gregs[FEXCore::X86State::REG_RSP],
+                    (long long)st.gregs[FEXCore::X86State::REG_RAX],
+                    (long long)st.gregs[FEXCore::X86State::REG_RDI],
                     iOSSyscallHandler::syscall_count.load());
         }
-        fex_log("WATCHDOG: Execution timed out after 2.5s!");
+        fex_log("WATCHDOG: Execution timed out after 5s!");
     });
     watchdog.detach();
 
@@ -699,7 +777,7 @@ int64_t fex_test_execute(void) {
 
     // Read the exit code (set by SyscallHandler before longjmp)
     int64_t exit_code = g_exit_code;
-    fex_log("Execution complete. Exit code = %lld (expected 42)", exit_code);
+    fex_log("Execution complete. Exit code = %lld (expected %lld)", exit_code, EXPECTED_EXIT);
 
     // Also read CPU state for debugging
     int64_t rax_val = static_cast<int64_t>(Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RAX]);
@@ -709,11 +787,11 @@ int64_t fex_test_execute(void) {
     g_ctx->DestroyThread(Thread);
     ::munmap(guest_mem, 0x100000);
 
-    if (exit_code == 42) {
-        fex_log("=== FEX test PASSED: x86-64 code correctly computed 42 ===");
-        cached_result.store(42);
+    if (exit_code == EXPECTED_EXIT) {
+        fex_log("=== FEX test PASSED: recursive fib(10) = %lld ===", exit_code);
+        cached_result.store(EXPECTED_EXIT);
         running.store(false);
-        return 42;
+        return EXPECTED_EXIT;
     }
 
     fex_log("=== FEX test result: exit_code=%lld, RAX=%lld, RDI=%lld ===", exit_code, rax_val, rdi_val);
