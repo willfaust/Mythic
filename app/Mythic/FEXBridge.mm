@@ -39,6 +39,9 @@
 #include <execinfo.h>
 #include <signal.h>
 
+// Embedded x86-64 ELF binary (Hello World, statically linked)
+#include "hello_x86.h"
+
 // __clear_cache is a compiler-rt builtin for icache invalidation.
 // On iOS ARM64 we provide it via sys_icache_invalidate.
 extern "C" void __clear_cache(void *start, void *end) {
@@ -517,122 +520,135 @@ int64_t fex_test_execute(void) {
         }
     }
 
-    // Create a small x86-64 program in guest memory:
-    //   mov eax, 42     ; B8 2A 00 00 00
-    //   ret              ; C3
-    //
-    // We'll place this at a fixed guest address and point FEX at it.
-    const uint64_t GUEST_CODE_ADDR = 0x10000;
-    const uint64_t GUEST_STACK_ADDR = 0x80000;
-    const uint64_t GUEST_STACK_SIZE = 0x10000;
+    // ---------------------------------------------------------------------------
+    // ELF Loader: Load a statically-linked x86-64 ELF binary
+    // ---------------------------------------------------------------------------
+    struct Elf64_Ehdr {
+        uint8_t  e_ident[16];
+        uint16_t e_type, e_machine;
+        uint32_t e_version;
+        uint64_t e_entry, e_phoff, e_shoff;
+        uint32_t e_flags;
+        uint16_t e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx;
+    };
+    struct Elf64_Phdr {
+        uint32_t p_type;
+        uint32_t p_flags;
+        uint64_t p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align;
+    };
+    constexpr uint32_t PT_LOAD = 1;
 
-    // Allocate guest memory (x86 code + stack)
-    void *guest_mem = ::mmap(
-        reinterpret_cast<void*>(GUEST_CODE_ADDR),
-        0x100000, // 1MB total
-        PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-        -1, 0
-    );
+    const uint8_t *elf_data = hello_x86_elf;
+    size_t elf_size = hello_x86_elf_len;
 
-    if (guest_mem == MAP_FAILED) {
-        // Try without MAP_FIXED
-        guest_mem = ::mmap(nullptr, 0x100000, PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (guest_mem == MAP_FAILED) {
-            fex_log("FAIL: Could not allocate guest memory");
-            return -1;
-        }
-        fex_log("Guest memory at %p (wanted 0x%llx)", guest_mem, (unsigned long long)GUEST_CODE_ADDR);
-    } else {
-        fex_log("Guest memory at %p", guest_mem);
+    auto *ehdr = reinterpret_cast<const Elf64_Ehdr*>(elf_data);
+
+    // Validate ELF
+    if (elf_size < sizeof(Elf64_Ehdr) ||
+        ehdr->e_ident[0] != 0x7f || ehdr->e_ident[1] != 'E' ||
+        ehdr->e_ident[2] != 'L'  || ehdr->e_ident[3] != 'F' ||
+        ehdr->e_ident[4] != 2    || // 64-bit
+        ehdr->e_machine != 0x3E) {  // x86-64
+        fex_log("FAIL: Invalid ELF binary");
+        running.store(false);
+        return -1;
     }
 
-    uint64_t code_addr = reinterpret_cast<uint64_t>(guest_mem);
-    uint64_t stack_addr = code_addr + 0x80000 + GUEST_STACK_SIZE; // Top of stack
+    fex_log("ELF: entry=0x%llx, %d program headers",
+            (unsigned long long)ehdr->e_entry, ehdr->e_phnum);
 
-    // x86-64 test: Recursive Fibonacci
-    //
-    // int fib(int n) {
-    //     if (n <= 1) return n;
-    //     return fib(n-1) + fib(n-2);
-    // }
-    // exit(fib(10));  // fib(10) = 55
-    //
-    // _start:
-    //   +00: mov edi, 10           ; n = 10
-    //   +05: call fib              ; call fib(10)
-    //   +0A: mov edi, eax          ; exit code = result
-    //   +0C: mov eax, 60           ; sys_exit
-    //   +11: syscall
-    //
-    // fib:
-    //   +13: push rbp
-    //   +14: mov rbp, rsp
-    //   +17: push rbx              ; save rbx (callee-saved)
-    //   +18: sub rsp, 8            ; align stack to 16 bytes
-    //   +1C: mov ebx, edi          ; ebx = n
-    //   +1E: cmp edi, 1
-    //   +21: jle .base_case
-    //   +23: lea edi, [rbx-1]      ; edi = n-1
-    //   +26: call fib              ; eax = fib(n-1)
-    //   +2B: mov r12d, eax         ; save fib(n-1) — wait, r12 might not be saved
-    //        Actually, let's use the stack to save fib(n-1):
-    //   +2B: push rax              ; save fib(n-1) on stack
-    //   +2C: lea edi, [rbx-2]      ; edi = n-2
-    //   +2F: call fib              ; eax = fib(n-2)
-    //   +34: pop rbx               ; rbx = fib(n-1) (reuse rbx since we're done with n)
-    //   +35: add eax, ebx          ; eax = fib(n-1) + fib(n-2)
-    //   +37: jmp .epilog
-    // .base_case:
-    //   +39: mov eax, ebx          ; return n (0 or 1)
-    // .epilog:
-    //   +3B: add rsp, 8            ; undo sub rsp,8
-    //   +3F: pop rbx               ; restore rbx
-    //   +40: pop rbp
-    //   +41: ret
-    //
-    uint8_t x86_code[] = {
-        // _start:
-        0xBF, 0x0A, 0x00, 0x00, 0x00,              // +00: mov edi, 10
-        0xE8, 0x09, 0x00, 0x00, 0x00,              // +05: call fib (+13)  rel32=0x13-(0x05+5)=0x09
-        0x89, 0xC7,                                 // +0A: mov edi, eax
-        0xB8, 0x3C, 0x00, 0x00, 0x00,              // +0C: mov eax, 60
-        0x0F, 0x05,                                 // +11: syscall (exit)
-        // fib:
-        0x55,                                       // +13: push rbp
-        0x48, 0x89, 0xE5,                           // +14: mov rbp, rsp
-        0x53,                                       // +17: push rbx
-        0x48, 0x83, 0xEC, 0x08,                     // +18: sub rsp, 8
-        0x89, 0xFB,                                 // +1C: mov ebx, edi
-        0x83, 0xFF, 0x01,                           // +1E: cmp edi, 1
-        0x7E, 0x16,                                 // +21: jle .base_case (+39)  rel8=0x39-(0x21+2)=0x16
-        0x8D, 0x7B, 0xFF,                           // +23: lea edi, [rbx-1]
-        0xE8, 0xE8, 0xFF, 0xFF, 0xFF,              // +26: call fib (+13)  rel32=0x13-0x2B=0xFFFFFFE8
-        0x50,                                       // +2B: push rax   (save fib(n-1))
-        0x8D, 0x7B, 0xFE,                           // +2C: lea edi, [rbx-2]
-        0xE8, 0xDF, 0xFF, 0xFF, 0xFF,              // +2F: call fib (+13)  rel32=0x13-(0x2F+5)=0xFFFFFFDF
-        0x5B,                                       // +34: pop rbx   (rbx = fib(n-1))
-        0x01, 0xD8,                                 // +35: add eax, ebx
-        0xEB, 0x02,                                 // +37: jmp .epilog (+3B)  rel8=0x3B-(0x37+2)=0x02
-        // .base_case:
-        0x89, 0xD8,                                 // +39: mov eax, ebx
-        // .epilog:
-        0x48, 0x83, 0xC4, 0x08,                     // +3B: add rsp, 8
-        0x5B,                                       // +3F: pop rbx
-        0x5D,                                       // +40: pop rbp
-        0xC3,                                       // +41: ret
-    };
-    const int64_t EXPECTED_EXIT = 55;  // fib(10) = 55
+    // Find the address range spanned by all PT_LOAD segments
+    uint64_t load_min = UINT64_MAX, load_max = 0;
+    constexpr uint64_t page_mask = 0x3FFF; // 16KB iOS pages
+    for (int i = 0; i < ehdr->e_phnum && i < 8; i++) {
+        auto *phdr = reinterpret_cast<const Elf64_Phdr*>(elf_data + ehdr->e_phoff + i * ehdr->e_phentsize);
+        if (phdr->p_type != PT_LOAD || phdr->p_memsz == 0) continue;
+        uint64_t seg_start = phdr->p_vaddr & ~page_mask;
+        uint64_t seg_end = (phdr->p_vaddr + phdr->p_memsz + page_mask) & ~page_mask;
+        if (seg_start < load_min) load_min = seg_start;
+        if (seg_end > load_max) load_max = seg_end;
+    }
+    size_t total_map_size = load_max - load_min;
+    fex_log("ELF: address range [0x%llx, 0x%llx), total %zu bytes",
+            (unsigned long long)load_min, (unsigned long long)load_max, total_map_size);
 
-    memcpy(reinterpret_cast<void*>(code_addr), x86_code, sizeof(x86_code));
-    fex_log("Wrote %zu bytes of x86-64 code at 0x%llx", sizeof(x86_code), (unsigned long long)code_addr);
-    fex_log("Stack at 0x%llx", (unsigned long long)stack_addr);
+    // Allocate a single contiguous region at any available address.
+    // iOS reserves low virtual addresses, so we let the OS choose.
+    void *elf_base = ::mmap(nullptr, total_map_size, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (elf_base == MAP_FAILED) {
+        fex_log("FAIL: Could not allocate %zu bytes for ELF: %s", total_map_size, strerror(errno));
+        running.store(false);
+        return -1;
+    }
 
-    // Push a return address of 0 onto the stack (signal end of execution)
-    uint64_t *stack_top = reinterpret_cast<uint64_t*>(stack_addr - 8);
-    *stack_top = 0;
-    stack_addr -= 8;
+    // The offset to apply: actual_addr = original_vaddr - load_min + elf_base
+    int64_t load_bias = reinterpret_cast<int64_t>(elf_base) - static_cast<int64_t>(load_min);
+    fex_log("ELF: mapped at %p, load_bias=0x%llx (original base 0x%llx)",
+            elf_base, (unsigned long long)load_bias, (unsigned long long)load_min);
+
+    // Track for cleanup
+    struct MappedRegion { void *addr; size_t size; };
+    MappedRegion mapped_regions[1];
+    mapped_regions[0] = {elf_base, total_map_size};
+    int num_mapped = 1;
+
+    // Copy PT_LOAD segment data into the allocated region
+    for (int i = 0; i < ehdr->e_phnum && i < 8; i++) {
+        auto *phdr = reinterpret_cast<const Elf64_Phdr*>(elf_data + ehdr->e_phoff + i * ehdr->e_phentsize);
+        if (phdr->p_type != PT_LOAD || phdr->p_memsz == 0) continue;
+
+        fex_log("ELF: LOAD vaddr=0x%llx filesz=0x%llx memsz=0x%llx flags=%c%c%c → actual 0x%llx",
+                (unsigned long long)phdr->p_vaddr,
+                (unsigned long long)phdr->p_filesz,
+                (unsigned long long)phdr->p_memsz,
+                (phdr->p_flags & 4) ? 'R' : '-',
+                (phdr->p_flags & 2) ? 'W' : '-',
+                (phdr->p_flags & 1) ? 'X' : '-',
+                (unsigned long long)(phdr->p_vaddr + load_bias));
+
+        // Copy file data at the biased address
+        if (phdr->p_filesz > 0) {
+            memcpy(reinterpret_cast<void*>(phdr->p_vaddr + load_bias),
+                   elf_data + phdr->p_offset, phdr->p_filesz);
+        }
+        // BSS (memsz > filesz) is already zeroed by mmap
+    }
+
+    uint64_t code_addr = ehdr->e_entry + load_bias;
+    fex_log("ELF loaded: entry point = 0x%llx (biased from 0x%llx), %d segments mapped",
+            (unsigned long long)code_addr, (unsigned long long)ehdr->e_entry, num_mapped);
+
+    // Verify entry point is readable
+    uint8_t firstByte = *reinterpret_cast<uint8_t*>(code_addr);
+    fex_log("First byte at entry 0x%llx: 0x%02x", (unsigned long long)code_addr, firstByte);
+
+    // Allocate a guest stack (separate from ELF segments)
+    const uint64_t GUEST_STACK_SIZE = 0x10000; // 64KB
+    void *stack_mem = ::mmap(nullptr, GUEST_STACK_SIZE, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (stack_mem == MAP_FAILED) {
+        fex_log("FAIL: Could not allocate guest stack");
+        running.store(false);
+        return -1;
+    }
+    uint64_t stack_addr = reinterpret_cast<uint64_t>(stack_mem) + GUEST_STACK_SIZE;
+
+    // Set up initial stack like the Linux kernel does for a static executable:
+    // RSP → argc (0)
+    //        argv[0] = NULL
+    //        envp[0] = NULL
+    //        AT_NULL (auxv terminator)
+    uint64_t *sp = reinterpret_cast<uint64_t*>(stack_addr);
+    *(--sp) = 0;    // AT_NULL value
+    *(--sp) = 0;    // AT_NULL type
+    *(--sp) = 0;    // envp[0] = NULL
+    *(--sp) = 0;    // argv[0] = NULL
+    *(--sp) = 0;    // argc = 0
+    stack_addr = reinterpret_cast<uint64_t>(sp);
+
+    fex_log("Stack at 0x%llx (base=%p, size=0x%x)",
+            (unsigned long long)stack_addr, stack_mem, GUEST_STACK_SIZE);
 
     // Create a thread for execution
     fex_log("Creating FEX thread (RIP=0x%llx, RSP=0x%llx)...",
@@ -641,7 +657,8 @@ int64_t fex_test_execute(void) {
     auto *Thread = g_ctx->CreateThread(code_addr, stack_addr);
     if (!Thread) {
         fex_log("FAIL: CreateThread returned null");
-        ::munmap(guest_mem, 0x100000);
+        for (int i = 0; i < num_mapped; i++) ::munmap(mapped_regions[i].addr, mapped_regions[i].size);
+        ::munmap(stack_mem, GUEST_STACK_SIZE);
         running.store(false);
         return -1;
     }
@@ -657,7 +674,8 @@ int64_t fex_test_execute(void) {
         if (callret_alloc == MAP_FAILED) {
             fex_log("FAIL: Could not allocate call-ret stack");
             g_ctx->DestroyThread(Thread);
-            ::munmap(guest_mem, 0x100000);
+            for (int i = 0; i < num_mapped; i++) ::munmap(mapped_regions[i].addr, mapped_regions[i].size);
+            ::munmap(stack_mem, GUEST_STACK_SIZE);
             running.store(false);
             return -1;
         }
@@ -705,36 +723,9 @@ int64_t fex_test_execute(void) {
             (void*)Thread->CurrentFrame->Pointers.SyscallHandlerObj,
             (void*)Thread->CurrentFrame->Pointers.SyscallHandlerFunc);
 
-    // Verify x86 code is readable at guest address
-    uint8_t firstByte = *reinterpret_cast<uint8_t*>(code_addr);
-    fex_log("First byte at RIP 0x%llx: 0x%02x (expected 0xB8)",
-            (unsigned long long)code_addr, firstByte);
-
     // Verify JIT pool is still valid
     fex_log("JIT pool: RX=%p, RW=%p, size=%zu, used=%zu",
             g_jit_rx_base, g_jit_rw_base, g_jit_pool_size, g_jit_pool_offset.load());
-
-    // Skip pre-compilation — let the dispatcher compile the full block at runtime.
-    // CompileRIPCount with MaxInst=4 creates a truncated block that poisons the cache.
-    fex_log("Skipping pre-compilation, dispatcher will compile on first execution");
-
-    // L2 cache and Dispatcher logging
-    {
-        auto l2ptr = Thread->CurrentFrame->Pointers.L2Pointer;
-        fex_log("L2Pointer = %p", (void*)l2ptr);
-    }
-
-    // Check Pointers struct
-    fex_log("Frame->Pointers.DispatcherLoopTop = %p",
-            (void*)Thread->CurrentFrame->Pointers.DispatcherLoopTop);
-    fex_log("Frame->Pointers.ExitFunctionLinker = %p",
-            (void*)Thread->CurrentFrame->Pointers.ExitFunctionLinker);
-    fex_log("Frame->Pointers.ThreadStopHandlerSpillSRA = %p",
-            (void*)Thread->CurrentFrame->Pointers.ThreadStopHandlerSpillSRA);
-    fex_log("Frame->Pointers.SyscallHandlerObj = %p",
-            (void*)Thread->CurrentFrame->Pointers.SyscallHandlerObj);
-    fex_log("Frame->Pointers.SyscallHandlerFunc = %p",
-            (void*)Thread->CurrentFrame->Pointers.SyscallHandlerFunc);
 
     g_exit_code = 0;
     g_exit_jmp_set = true;
@@ -777,7 +768,7 @@ int64_t fex_test_execute(void) {
 
     // Read the exit code (set by SyscallHandler before longjmp)
     int64_t exit_code = g_exit_code;
-    fex_log("Execution complete. Exit code = %lld (expected %lld)", exit_code, EXPECTED_EXIT);
+    fex_log("Execution complete. Exit code = %lld (expected 0)", exit_code);
 
     // Also read CPU state for debugging
     int64_t rax_val = static_cast<int64_t>(Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RAX]);
@@ -785,16 +776,19 @@ int64_t fex_test_execute(void) {
     fex_log("CPU state: RAX=%lld, RDI=%lld", rax_val, rdi_val);
 
     g_ctx->DestroyThread(Thread);
-    ::munmap(guest_mem, 0x100000);
+    for (int i = 0; i < num_mapped; i++) {
+        ::munmap(mapped_regions[i].addr, mapped_regions[i].size);
+    }
+    ::munmap(stack_mem, GUEST_STACK_SIZE);
 
-    if (exit_code == EXPECTED_EXIT) {
-        fex_log("=== FEX test PASSED: recursive fib(10) = %lld ===", exit_code);
-        cached_result.store(EXPECTED_EXIT);
+    if (exit_code == 0) {
+        fex_log("=== FEX ELF test PASSED: Hello World exited with code 0 ===");
+        cached_result.store(0);
         running.store(false);
-        return EXPECTED_EXIT;
+        return 0;
     }
 
-    fex_log("=== FEX test result: exit_code=%lld, RAX=%lld, RDI=%lld ===", exit_code, rax_val, rdi_val);
+    fex_log("=== FEX ELF test result: exit_code=%lld, RAX=%lld, RDI=%lld ===", exit_code, rax_val, rdi_val);
     cached_result.store(static_cast<int64_t>(exit_code));
     running.store(false);
     return static_cast<int64_t>(exit_code);
