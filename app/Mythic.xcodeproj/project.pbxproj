@@ -21,6 +21,15 @@
 		A1000015 /* libsoftfloat_3e.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000015; };
 		A1000016 /* libc++.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000016; };
 		A1000017 /* libJemallocLibs.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000017; };
+		A1000020 /* WineServerBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = A200001E; };
+		A1000021 /* libwineserver.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000020; };
+		A1000022 /* nls in Resources */ = {isa = PBXBuildFile; fileRef = A2000021; };
+		A1000030 /* WineProcessBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = A2000030; };
+		A1000031 /* libntdll_unix.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000032; };
+		A1000032 /* aarch64-windows in Resources */ = {isa = PBXBuildFile; fileRef = A2000033; };
+		A1000033 /* wine_stubs.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000034; };
+		A1000034 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000035; };
+		A1000035 /* StikJITHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000036; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -44,6 +53,17 @@
 		A2000015 /* libsoftfloat_3e.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libsoftfloat_3e.a; path = "../../FEX/build-ios/External/SoftFloat-3e/libsoftfloat_3e.a"; sourceTree = "<group>"; };
 		A2000016 /* libc++.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = "libc++.tbd"; path = "usr/lib/libc++.tbd"; sourceTree = SDKROOT; };
 		A2000017 /* libJemallocLibs.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libJemallocLibs.a; path = "../../FEX/build-ios/FEXCore/Source/libJemallocLibs.a"; sourceTree = "<group>"; };
+		A200001E /* WineServerBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WineServerBridge.m; sourceTree = "<group>"; };
+		A200001F /* WineServerBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = WineServerBridge.h; sourceTree = "<group>"; };
+		A2000020 /* libwineserver.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libwineserver.a; sourceTree = "<group>"; };
+		A2000021 /* nls */ = {isa = PBXFileReference; lastKnownFileType = folder; path = nls; sourceTree = "<group>"; };
+		A2000030 /* WineProcessBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WineProcessBridge.m; sourceTree = "<group>"; };
+		A2000031 /* WineProcessBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = WineProcessBridge.h; sourceTree = "<group>"; };
+		A2000032 /* libntdll_unix.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libntdll_unix.a; sourceTree = "<group>"; };
+		A2000033 /* aarch64-windows */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "aarch64-windows"; sourceTree = "<group>"; };
+		A2000034 /* wine_stubs.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wine_stubs.c; sourceTree = "<group>"; };
+		A2000035 /* IOKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOKit.framework; path = System/Library/Frameworks/IOKit.framework; sourceTree = SDKROOT; };
+		A2000036 /* StikJITHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StikJITHelper.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -59,6 +79,9 @@
 				A1000015 /* libsoftfloat_3e.a in Frameworks */,
 				A1000016 /* libc++.tbd in Frameworks */,
 				A1000017 /* libJemallocLibs.a in Frameworks */,
+				A1000021 /* libwineserver.a in Frameworks */,
+				A1000031 /* libntdll_unix.a in Frameworks */,
+				A1000034 /* IOKit.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -84,7 +107,15 @@
 				A2000005 /* JITAllocator.h */,
 				A200000B /* FEXBridge.mm */,
 				A200000C /* FEXBridge.h */,
+				A200001E /* WineServerBridge.m */,
+				A200001F /* WineServerBridge.h */,
+				A2000030 /* WineProcessBridge.m */,
+				A2000031 /* WineProcessBridge.h */,
 				A200000A /* EntitlementChecker.swift */,
+				A2000036 /* StikJITHelper.swift */,
+				A2000021 /* nls */,
+				A2000033 /* aarch64-windows */,
+				A2000034 /* wine_stubs.c */,
 				A2000006 /* Mythic-Bridging-Header.h */,
 				A2000007 /* Mythic.entitlements */,
 				A2000008 /* Info.plist */,
@@ -111,6 +142,9 @@
 				A2000015 /* libsoftfloat_3e.a */,
 				A2000016 /* libc++.tbd */,
 				A2000017 /* libJemallocLibs.a */,
+				A2000020 /* libwineserver.a */,
+				A2000032 /* libntdll_unix.a */,
+				A2000035 /* IOKit.framework */,
 			);
 			name = Libraries;
 			sourceTree = "<group>";
@@ -173,6 +207,8 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A1000022 /* nls in Resources */,
+				A1000032 /* aarch64-windows in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -189,6 +225,10 @@
 				A1000004 /* JITAllocator.c in Sources */,
 				A1000005 /* EntitlementChecker.swift in Sources */,
 				A1000006 /* FEXBridge.mm in Sources */,
+				A1000020 /* WineServerBridge.m in Sources */,
+				A1000030 /* WineProcessBridge.m in Sources */,
+				A1000033 /* wine_stubs.c in Sources */,
+				A1000035 /* StikJITHelper.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -288,6 +328,7 @@
 					"$(SRCROOT)/../FEX/build-ios/External/cephes",
 					"$(SRCROOT)/../FEX/build-ios/External/xxhash/cmake_unofficial",
 					"$(SRCROOT)/../FEX/build-ios/External/SoftFloat-3e",
+					"$(SRCROOT)/Mythic",
 				);
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -337,6 +378,7 @@
 					"$(SRCROOT)/../FEX/build-ios/External/cephes",
 					"$(SRCROOT)/../FEX/build-ios/External/xxhash/cmake_unofficial",
 					"$(SRCROOT)/../FEX/build-ios/External/SoftFloat-3e",
+					"$(SRCROOT)/Mythic",
 				);
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

@@ -1,0 +1,189 @@
+// WineProcessBridge.m - Initialize Wine's ntdll Unix-side on iOS
+// This calls __wine_main() to bootstrap the Wine process, connecting
+// to the already-running wineserver thread.
+
+#import <Foundation/Foundation.h>
+#import <os/log.h>
+#import <pthread.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <setjmp.h>
+
+#include "WineProcessBridge.h"
+#include "WineServerBridge.h"
+
+// Globals for wine_ios_exit longjmp (used by wine_ios_exit.h shim in ntdll)
+jmp_buf wine_ios_exit_jmpbuf;
+volatile int wine_ios_exit_code = 0;
+pthread_t wine_ios_main_thread;
+
+static os_log_t wine_proc_log(void) {
+    static os_log_t log;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ log = os_log_create("com.mythic.emulator", "wine-proc"); });
+    return log;
+}
+
+#define LOG(fmt, ...) os_log(wine_proc_log(), "[WineProc] " fmt, ##__VA_ARGS__)
+
+// Wine's main entry point (from ntdll unix loader.c, statically linked)
+extern void __wine_main(int argc, char *argv[]);
+
+// File-based logging (from server_ios.c)
+extern void wine_log_set_file(const char *path);
+
+static pthread_t g_wine_thread;
+static volatile int g_wine_running = 0;
+static char *g_prefix_path = NULL;
+
+static void *wine_process_thread(void *arg) {
+    @autoreleasepool {
+        LOG("Wine process thread started");
+
+        // Set environment for Wine
+        setenv("WINEPREFIX", g_prefix_path, 1);
+        setenv("HOME", g_prefix_path, 1);
+
+        // Skip check_command_line / reexec_loader
+        setenv("WINELOADERNOEXEC", "1", 1);
+
+        // Set DLL search path to app bundle (contains aarch64-windows/ with PE DLLs)
+        {
+            NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
+            setenv("WINEDLLPATH", bundlePath.UTF8String, 1);
+            LOG("WINEDLLPATH=%{public}s", bundlePath.UTF8String);
+        }
+
+        // Debug output
+        setenv("WINEDEBUG", "err+all,fixme+all,warn+module", 1);
+
+        LOG("WINEPREFIX=%{public}s", g_prefix_path);
+
+        // Set up file-based logging for Wine C code
+        {
+            NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+            NSString *logPath = [docs stringByAppendingPathComponent:@"mythic-log.txt"];
+            wine_log_set_file(logPath.UTF8String);
+            LOG("Wine log file: %{public}s", logPath.UTF8String);
+        }
+
+        // Redirect stderr to log file so Wine debug output (WINEDEBUG) is captured
+        {
+            NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+            NSString *stderrPath = [docs stringByAppendingPathComponent:@"mythic-log.txt"];
+            int logfd = open(stderrPath.UTF8String, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (logfd >= 0) {
+                dup2(logfd, STDERR_FILENO);
+                close(logfd);
+            }
+        }
+
+        // Ensure Wine prefix has system32 directory with DLLs from bundle
+        {
+            NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
+            NSString *dllSource = [bundlePath stringByAppendingPathComponent:@"aarch64-windows"];
+            NSString *prefix = [NSString stringWithUTF8String:g_prefix_path];
+            NSString *sys32Dir = [prefix stringByAppendingPathComponent:@"drive_c/windows/system32"];
+            NSFileManager *fm = [NSFileManager defaultManager];
+
+            [fm createDirectoryAtPath:sys32Dir withIntermediateDirectories:YES attributes:nil error:nil];
+
+            NSArray *dlls = [fm contentsOfDirectoryAtPath:dllSource error:nil];
+            int linked = 0;
+            for (NSString *dll in dlls) {
+                NSString *src = [dllSource stringByAppendingPathComponent:dll];
+                NSString *dst = [sys32Dir stringByAppendingPathComponent:dll];
+                // Remove stale symlinks and re-create (bundle path changes on reinstall)
+                [fm removeItemAtPath:dst error:nil];
+                if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil])
+                    linked++;
+            }
+            LOG("Symlinked %d DLLs from bundle to %{public}s", linked, sys32Dir.UTF8String);
+        }
+
+        // Call Wine's main entry point
+        // argv[0] = "wine", argv[1] = program to run
+        char *argv[] = { "wine", "C:\\windows\\system32\\cmd.exe", NULL };
+        int argc = 2;
+
+        // Record this thread so wine_ios_exit knows where to longjmp
+        wine_ios_main_thread = pthread_self();
+
+        LOG("Calling __wine_main...");
+
+        if (setjmp(wine_ios_exit_jmpbuf) == 0) {
+            __wine_main(argc, argv);
+            dprintf(STDERR_FILENO, "[WineProc] __wine_main returned normally\n");
+        } else {
+            dprintf(STDERR_FILENO, "[WineProc] Wine exited with code %d (caught by longjmp)\n", wine_ios_exit_code);
+        }
+
+        g_wine_running = 0;
+
+        // Stop wineserver to prevent CPU spin (iOS kills for excessive CPU)
+        dprintf(STDERR_FILENO, "[WineProc] stopping wineserver...\n");
+        wineserver_stop();
+
+        dprintf(STDERR_FILENO, "[WineProc] Wine process thread finished cleanly\n");
+    }
+    return NULL;
+}
+
+int wine_process_start(const char *prefix_path) {
+    if (g_wine_running) {
+        LOG("Wine process already running");
+        return 0;
+    }
+
+    if (g_prefix_path) free(g_prefix_path);
+    g_prefix_path = strdup(prefix_path);
+
+    LOG("Starting Wine process with prefix: %{public}s", prefix_path);
+
+    g_wine_running = 1;
+
+    // Create socketpair to bypass broken iOS UDS accept()
+    // pair[0] = wineserver side (injected as client fd)
+    // pair[1] = ntdll side (used as fd_socket)
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == -1) {
+        LOG("socketpair failed: %{public}s", strerror(errno));
+        g_wine_running = 0;
+        return -1;
+    }
+    LOG("socketpair created: server_fd=%d, client_fd=%d", pair[0], pair[1]);
+
+    // Set env var for ntdll to pick up instead of server_connect()
+    // Must use WINESERVERSOCKET — that's what Wine's server_init_process() checks
+    char fd_str[16];
+    snprintf(fd_str, sizeof(fd_str), "%d", pair[1]);
+    setenv("WINESERVERSOCKET", fd_str, 1);
+
+    // Inject wineserver side — the event loop will pick this up
+    wineserver_inject_client_fd(pair[0]);
+
+    // Lower priority so Wine init doesn't starve the main thread
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    struct sched_param sched = { .sched_priority = 20 };  // lower than default (31)
+    pthread_attr_setschedparam(&attr, &sched);
+
+    int ret = pthread_create(&g_wine_thread, &attr, wine_process_thread, NULL);
+    pthread_attr_destroy(&attr);
+    if (ret != 0) {
+        LOG("Failed to create Wine process thread: %d", ret);
+        close(pair[0]);
+        close(pair[1]);
+        g_wine_running = 0;
+        return -1;
+    }
+
+    pthread_detach(g_wine_thread);
+    LOG("Wine process thread created");
+    return 0;
+}
+
+int wine_process_is_running(void) {
+    return g_wine_running;
+}

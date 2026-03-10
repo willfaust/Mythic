@@ -8,6 +8,13 @@ research/
 app/build/
 app/DerivedData/
 FEX/build-ios/
+build/ntdll-unix/obj/
+build/wineserver/obj/
+
+# Compiled libraries (rebuilt from build scripts)
+app/Mythic/libntdll_unix.a
+app/Mythic/libwineserver.a
+app/libwineserver.a
 
 # Xcode
 *.xcuserdata
@@ -21,7 +28,14 @@ xcuserdata/
 
 # Console/crash logs (large, device-specific)
 console-log.txt
+crash-log.txt
 crash-log,txt
+stikdebug-log.txt
+
+# Superseded build dirs
+wine-ios-build/
+
+# wine/ is now a submodule — don't ignore it
 
 # StikDebug scripts (reference only)
 MeloNX.js

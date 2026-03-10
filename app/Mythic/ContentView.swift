@@ -1,4 +1,5 @@
 import SwiftUI
+import os.log
 
 struct ContentView: View {
     @StateObject private var logStore = LogStore.shared
@@ -124,10 +125,21 @@ struct ContentView: View {
     private var actionButtons: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 12) {
+                Button("Enable JIT") {
+                    enableJITViaStikDebug()
+                }
+                .buttonStyle(.borderedProminent)
+
+                Button("Run Wine") {
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+
                 Button("Test JIT") {
                     runJITTest()
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.bordered)
 
                 Button("Test JIT (Alt)") {
                     runJITTestStrategy2()
@@ -137,13 +149,20 @@ struct ContentView: View {
                 Button("Test FEX") {
                     runFEXTest()
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.bordered)
                 .tint(.purple)
 
-                Button("Test Dual Map") {
-                    testDualMapping()
+                Button("Start Wineserver") {
+                    startWineserver()
                 }
                 .buttonStyle(.bordered)
+                .tint(.green)
+
+                Button("Start Wine") {
+                    startWineProcess()
+                }
+                .buttonStyle(.bordered)
+                .tint(.orange)
 
                 Button("Clear Log") {
                     logStore.clear()
@@ -156,27 +175,19 @@ struct ContentView: View {
     }
 
     private var logConsole: some View {
-        ScrollViewReader { proxy in
-            List(logStore.entries) { entry in
-                HStack(alignment: .top, spacing: 8) {
-                    Text(entry.level.rawValue)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundColor(colorForLevel(entry.level))
-                        .frame(width: 30)
-                    Text(entry.message)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundColor(.primary)
-                }
-                .id(entry.id)
-                .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 2, trailing: 8))
+        List(logStore.entries.suffix(200)) { entry in
+            HStack(alignment: .top, spacing: 8) {
+                Text(entry.level.rawValue)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(colorForLevel(entry.level))
+                    .frame(width: 30)
+                Text(entry.message)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.primary)
             }
-            .listStyle(.plain)
-            .onChange(of: logStore.entries.count) { _ in
-                if let last = logStore.entries.last {
-                    proxy.scrollTo(last.id, anchor: .bottom)
-                }
-            }
+            .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 2, trailing: 8))
         }
+        .listStyle(.plain)
     }
 
     private var statusColor: Color {
@@ -310,6 +321,138 @@ struct ContentView: View {
                     logStore.log("FEX-Emu test returned \(result)", level: .error)
                 }
             }
+        }
+    }
+
+    private func enableJITViaStikDebug() {
+        jitStatus = .testing
+        logStore.log("Requesting JIT via StikDebug URL scheme...")
+
+        StikJITHelper.enableJIT { success in
+            if success {
+                jitStatus = .available
+                logStore.log("JIT enabled! Debugger attached.", level: .success)
+            } else {
+                jitStatus = .unavailable
+                logStore.log("Failed to enable JIT via StikDebug", level: .error)
+            }
+        }
+    }
+
+    /// Full sequence: allocate JIT pool, start wineserver, start Wine.
+    /// Debugger stays attached during PE loading so mprotect_exec can use BRK
+    /// to prepare code pages. Detach happens after Wine finishes + recovery.
+    private func runWineFullSequence() {
+        guard jit_check_debugged() else {
+            logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
+            return
+        }
+
+        logStore.log("Running full Wine sequence...")
+
+        // Start a main thread heartbeat to diagnose hang
+        var heartbeatCount = 0
+        let heartbeat = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
+            heartbeatCount += 1
+            os_log("[HEARTBEAT] main thread alive #%d", heartbeatCount)
+        }
+
+        // Pause UI flushing — prevents ALL SwiftUI re-renders during Wine execution,
+        // so zero main thread hang time accumulates while debugger is attached
+        logStore.uiPaused = true
+
+        // Suppress os_log from wineserver — hundreds of messages/sec cause os_log buffer
+        // contention that blocks the main thread RunLoop, triggering iOS hang detection
+        ws_log_quiet = 1
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Step 1: Allocate JIT pool (BRK suspends entire process)
+            let poolSizeMB = 128
+            logStore.log("Allocating \(poolSizeMB)MB JIT pool (BRK will suspend process)...")
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let pool = StikJITHelper.allocatePool(poolSize: poolSizeMB * 1024 * 1024)
+            let elapsed = CFAbsoluteTimeGetCurrent() - t0
+            logStore.log("BRK suspension lasted \(String(format: "%.2f", elapsed))s")
+
+            if let pool = pool {
+                logStore.log("JIT pool: RX=\(String(format: "%p", Int(bitPattern: pool.rx))), RW=\(String(format: "%p", Int(bitPattern: pool.rw))), size=\(pool.size / 1024 / 1024)MB", level: .success)
+                setenv("WINE_IOS_JIT_RX", String(format: "%lx", Int(bitPattern: pool.rx)), 1)
+                setenv("WINE_IOS_JIT_RW", String(format: "%lx", Int(bitPattern: pool.rw)), 1)
+                setenv("WINE_IOS_JIT_SIZE", String(format: "%lx", pool.size), 1)
+            } else {
+                logStore.log("JIT pool allocation failed, continuing without it", level: .error)
+            }
+
+            // Step 2: Start wineserver
+            self.startWineserver()
+
+            // Step 3: Start Wine (debugger still attached for PE loading BRK calls)
+            Thread.sleep(forTimeInterval: 2.0)
+            self.startWineProcess()
+
+            // Step 4: Wait for Wine to finish instead of fixed timer
+            // Poll wine_process_is_running() — it clears when __wine_main returns
+            logStore.log("Waiting for Wine to finish PE loading...")
+            let maxWait = 30.0  // safety cap
+            let pollStart = CFAbsoluteTimeGetCurrent()
+            while wine_process_is_running() != 0 {
+                Thread.sleep(forTimeInterval: 0.25)
+                if CFAbsoluteTimeGetCurrent() - pollStart > maxWait {
+                    logStore.log("Wine still running after \(Int(maxWait))s, proceeding with detach", level: .error)
+                    break
+                }
+            }
+            let wineElapsed = CFAbsoluteTimeGetCurrent() - pollStart
+            logStore.log("Wine finished after \(String(format: "%.1f", wineElapsed))s")
+
+            // Step 5: Resume UI + os_log, give main thread time to recover before detach
+            DispatchQueue.main.async {
+                ws_log_quiet = 0
+                logStore.uiPaused = false
+            }
+            Thread.sleep(forTimeInterval: 2.0)
+
+            // Step 6: Detach debugger — main thread should have zero accumulated hang time
+            logStore.log("Detaching debugger...")
+            StikJITHelper.detachDebugger()
+
+            DispatchQueue.main.async { heartbeat.invalidate() }
+        }
+    }
+
+    private func startWineserver() {
+        logStore.log("Starting wineserver...")
+
+        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let winePrefixPath = documentsPath.appendingPathComponent("wine").path
+
+        logStore.log("Wine prefix: \(winePrefixPath)")
+
+        let result = wineserver_start(winePrefixPath)
+        if result == 0 {
+            logStore.log("Wineserver thread launched successfully", level: .success)
+        } else {
+            logStore.log("Failed to start wineserver (error: \(result))", level: .error)
+        }
+    }
+
+    private func startWineProcess() {
+        logStore.log("Starting Wine process...")
+
+        if wineserver_is_running() == 0 {
+            logStore.log("Wineserver not running! Start it first.", level: .error)
+            return
+        }
+
+        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let winePrefixPath = documentsPath.appendingPathComponent("wine").path
+
+        // Call synchronously — caller already waited for wineserver to be ready
+        let result = wine_process_start(winePrefixPath)
+        if result == 0 {
+            logStore.log("Wine process thread launched", level: .success)
+        } else {
+            logStore.log("Failed to start Wine process (error: \(result))", level: .error)
         }
     }
 
