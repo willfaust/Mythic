@@ -13,10 +13,12 @@
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
 
-// Globals for wine_ios_exit longjmp (used by wine_ios_exit.h shim in ntdll)
-jmp_buf wine_ios_exit_jmpbuf;
-volatile int wine_ios_exit_code = 0;
-pthread_t wine_ios_main_thread;
+// Thread-local globals for wine_ios_exit longjmp (used by wine_ios_exit.h shim in ntdll)
+// Each Wine "process" thread has its own jmpbuf so child processes can exit independently.
+_Thread_local jmp_buf wine_ios_exit_jmpbuf;
+_Thread_local volatile int wine_ios_exit_code = 0;
+_Thread_local pthread_t wine_ios_main_thread;
+_Thread_local int wine_ios_exit_initialized = 0;
 
 static os_log_t wine_proc_log(void) {
     static os_log_t log;
@@ -56,7 +58,7 @@ static void *wine_process_thread(void *arg) {
         }
 
         // Debug output
-        setenv("WINEDEBUG", "err+all,fixme+all,warn+module", 1);
+        setenv("WINEDEBUG", "err+all,fixme+all,warn+module,trace+process", 1);
 
         LOG("WINEPREFIX=%{public}s", g_prefix_path);
 
@@ -104,11 +106,12 @@ static void *wine_process_thread(void *arg) {
 
         // Call Wine's main entry point
         // argv[0] = "wine", argv[1] = program to run
-        char *argv[] = { "wine", "C:\\windows\\system32\\cmd.exe", NULL };
-        int argc = 2;
+        char *argv[] = { "wine", "C:\\windows\\system32\\start.exe", "/wait", "cmd.exe", NULL };
+        int argc = 4;
 
         // Record this thread so wine_ios_exit knows where to longjmp
         wine_ios_main_thread = pthread_self();
+        wine_ios_exit_initialized = 1;
 
         LOG("Calling __wine_main...");
 

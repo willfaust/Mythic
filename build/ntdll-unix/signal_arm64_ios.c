@@ -220,18 +220,74 @@ volatile int ios_total_segv_count = 0;
 static __thread uintptr_t ios_teb_for_signals = 0;
 
 /*
- * Mach exception handler for EXC_BAD_ACCESS on the PE thread.
- * Runs on a separate thread — no sigreturn, so x18 is preserved on resume.
- * Handles x18=0 (TEB corruption) and user_shared_data (0x7FFE0000) redirects.
+ * Per-thread Mach exception handler for EXC_BAD_ACCESS.
+ * ONE handler thread serves ALL Wine "process" threads.
+ * Each Wine thread registers its Mach thread port, TEB, and trampoline
+ * in a shared registry. The handler looks up the correct TEB/trampoline
+ * for the faulting thread.
+ *
+ * Handles: x18=0 (TEB corruption), user_shared_data (0x7FFE0000) redirects,
+ * and PE→JIT pool execution redirects.
  * Unhandled exceptions fall through to the POSIX SIGSEGV handler.
  */
 static mach_port_t ios_exc_port = MACH_PORT_NULL;
-static uintptr_t ios_exc_teb = 0;
+static int ios_exc_handler_started = 0;
 static uintptr_t ios_exc_usd = 0;
 volatile int64_t ios_exc_x18_fixes = 0;
 volatile int64_t ios_exc_usd_fixes = 0;
 volatile int ios_exc_thread_alive = 0;
 volatile int ios_exc_msg_count = 0;
+
+/* Per-thread trampoline for signal handlers (runs on faulting thread) */
+static __thread void *ios_my_trampoline = NULL;
+static __thread int ios_my_slot = -1;
+
+/* Thread registry: maps Mach thread port → TEB + trampoline */
+#define IOS_MAX_WINE_THREADS 64
+/* Forward declarations for per-thread JIT mappings */
+extern void *ios_jit_translate_addr_with_overrides(void *addr, void *overrides, int override_count);
+extern int ios_jit_addr_is_text_with_overrides(uintptr_t addr, void *overrides, int override_count);
+
+struct ios_thread_entry {
+    thread_t mach_thread;
+    uintptr_t teb;
+    void *trampoline;
+    void *jit_mappings;     /* per-thread JIT mapping overrides (struct ios_jit_mapping *) */
+    int jit_mapping_count;  /* number of per-thread overrides */
+};
+static struct ios_thread_entry ios_thread_registry[IOS_MAX_WINE_THREADS];
+static volatile int32_t ios_thread_count = 0;
+
+static int ios_lookup_thread(thread_t mach_thread, uintptr_t *teb_out, void **tramp_out,
+                             void **mappings_out, int *mapping_count_out)
+{
+    int count = __sync_fetch_and_add(&ios_thread_count, 0);
+    for (int i = 0; i < count; i++)
+    {
+        if (ios_thread_registry[i].mach_thread == mach_thread)
+        {
+            *teb_out = ios_thread_registry[i].teb;
+            *tramp_out = ios_thread_registry[i].trampoline;
+            if (mappings_out) *mappings_out = ios_thread_registry[i].jit_mappings;
+            if (mapping_count_out) *mapping_count_out = ios_thread_registry[i].jit_mapping_count;
+            return 1;
+        }
+    }
+    /* Fallback: use first registered thread */
+    if (count > 0)
+    {
+        *teb_out = ios_thread_registry[0].teb;
+        *tramp_out = ios_thread_registry[0].trampoline;
+        if (mappings_out) *mappings_out = NULL;
+        if (mapping_count_out) *mapping_count_out = 0;
+        return 1;
+    }
+    *teb_out = 0;
+    *tramp_out = NULL;
+    if (mappings_out) *mappings_out = NULL;
+    if (mapping_count_out) *mapping_count_out = 0;
+    return 0;
+}
 
 /* Diagnostic: first .data fault captured by Mach handler */
 volatile uint64_t ios_exc_data_fault_pc = 0;
@@ -271,6 +327,34 @@ typedef struct {
 } ios_exc_reply_t;
 #pragma pack()
 
+/* Proactively fix x18=0 on all registered PE threads.
+ * Called from the Mach handler thread on timer timeout.
+ * Uses thread_suspend/get_state/set_state/resume — no signals involved. */
+static void ios_poll_fix_x18(void)
+{
+    int count = __sync_fetch_and_add(&ios_thread_count, 0);
+    for (int i = 0; i < count; i++)
+    {
+        thread_t t = ios_thread_registry[i].mach_thread;
+        uintptr_t teb = ios_thread_registry[i].teb;
+        if (!teb) continue;
+
+        kern_return_t kr = thread_suspend(t);
+        if (kr != KERN_SUCCESS) continue;
+
+        arm_thread_state64_t state;
+        mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+        kr = thread_get_state(t, ARM_THREAD_STATE64, (thread_state_t)&state, &sc);
+        if (kr == KERN_SUCCESS && state.__x[18] == 0)
+        {
+            state.__x[18] = teb;
+            thread_set_state(t, ARM_THREAD_STATE64, (thread_state_t)&state, sc);
+            ios_exc_x18_fixes++;
+        }
+        thread_resume(t);
+    }
+}
+
 static void *ios_mach_exception_thread( void *arg )
 {
     mach_port_t port = (mach_port_t)(uintptr_t)arg;
@@ -298,6 +382,14 @@ static void *ios_mach_exception_thread( void *arg )
         thread_t thread = req->thread.name;
         int handled = 0;
 
+        /* Look up per-thread TEB, trampoline, and JIT mappings for the faulting thread */
+        uintptr_t thread_teb = 0;
+        void *thread_trampoline = NULL;
+        void *thread_jit_mappings = NULL;
+        int thread_jit_mapping_count = 0;
+        ios_lookup_thread( thread, &thread_teb, &thread_trampoline,
+                          &thread_jit_mappings, &thread_jit_mapping_count );
+
         /* Get faulting thread's register state */
         arm_thread_state64_t state;
         mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
@@ -323,7 +415,6 @@ static void *ios_mach_exception_thread( void *arg )
              * The PE-side loader calls DLL entry points at original mapping
              * addresses which aren't executable on iOS. Translate to JIT. */
             {
-                extern void *ios_jit_teb_trampoline;
                 extern void *ios_jit_rx_base_global;
                 extern size_t ios_jit_pool_size_global;
                 extern int ios_jit_addr_is_text(uintptr_t addr);
@@ -332,7 +423,7 @@ static void *ios_mach_exception_thread( void *arg )
                 uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
                 int is_exec_fault = (fault_addr == (uintptr_t)fault_pc);
 
-                if (is_exec_fault && ios_jit_teb_trampoline)
+                if (is_exec_fault && thread_trampoline)
                 {
                     uintptr_t jit_rx = (uintptr_t)ios_jit_rx_base_global;
                     size_t jit_sz = ios_jit_pool_size_global;
@@ -340,25 +431,32 @@ static void *ios_mach_exception_thread( void *arg )
                     if (fault_pc >= jit_rx && fault_pc < jit_rx + jit_sz)
                     {
                         /* Exec fault IN JIT pool — only fixable if in .text (x18 issue) */
-                        if (ios_jit_addr_is_text(fault_pc) && state.__x[18] == 0 && ios_exc_teb)
+                        if (ios_jit_addr_is_text(fault_pc) && state.__x[18] == 0 && thread_teb)
                         {
                             state.__x[17] = fault_pc;
-                            __darwin_arm_thread_state64_set_pc_fptr(state, ios_jit_teb_trampoline);
+                            __darwin_arm_thread_state64_set_pc_fptr(state, thread_trampoline);
                             ios_exc_x18_fixes++;
                             handled = 1;
                         }
                     }
                     else
                     {
-                        /* Exec fault OUTSIDE JIT pool — try to translate to JIT equivalent */
-                        void *jit_pc = ios_jit_translate_addr((void *)(uintptr_t)fault_pc);
+                        /* Exec fault OUTSIDE JIT pool — try to translate to JIT equivalent.
+                         * Use per-thread mappings if available (child process). */
+                        void *jit_pc;
+                        if (thread_jit_mappings && thread_jit_mapping_count > 0)
+                            jit_pc = ios_jit_translate_addr_with_overrides(
+                                (void *)(uintptr_t)fault_pc,
+                                thread_jit_mappings, thread_jit_mapping_count);
+                        else
+                            jit_pc = ios_jit_translate_addr((void *)(uintptr_t)fault_pc);
                         if (jit_pc != (void *)(uintptr_t)fault_pc)
                         {
-                            if (ios_exc_teb && state.__x[18] == 0)
+                            if (thread_teb && state.__x[18] == 0)
                             {
                                 /* Also fix x18 via trampoline */
                                 state.__x[17] = (uint64_t)(uintptr_t)jit_pc;
-                                __darwin_arm_thread_state64_set_pc_fptr(state, ios_jit_teb_trampoline);
+                                __darwin_arm_thread_state64_set_pc_fptr(state, thread_trampoline);
                             }
                             else
                             {
@@ -374,24 +472,20 @@ static void *ios_mach_exception_thread( void *arg )
 
             /* 3. Fix x18=0 for DATA ACCESS faults.
              * iOS zeros x18 on context switch / thread_set_state.
-             * Route through TEB trampoline to restore x18. */
-            if (!handled && state.__x[18] == 0 && ios_exc_teb)
+             * Route through per-thread TEB trampoline to restore x18. */
+            if (!handled && state.__x[18] == 0 && thread_teb && thread_trampoline)
             {
-                extern void *ios_jit_teb_trampoline;
-                if (ios_jit_teb_trampoline)
-                {
-                    uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
-                    int is_exec_fault = (fault_addr == (uintptr_t)fault_pc);
+                uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
+                int is_exec_fault = (fault_addr == (uintptr_t)fault_pc);
 
-                    if (!is_exec_fault)
-                    {
-                        /* Data access fault — x18=0 caused a bad load/store.
-                         * Fix x18 via trampoline regardless of where PC is. */
-                        state.__x[17] = fault_pc;
-                        __darwin_arm_thread_state64_set_pc_fptr(state, ios_jit_teb_trampoline);
-                        ios_exc_x18_fixes++;
-                        handled = 1;
-                    }
+                if (!is_exec_fault)
+                {
+                    /* Data access fault — x18=0 caused a bad load/store.
+                     * Fix x18 via trampoline regardless of where PC is. */
+                    state.__x[17] = fault_pc;
+                    __darwin_arm_thread_state64_set_pc_fptr(state, thread_trampoline);
+                    ios_exc_x18_fixes++;
+                    handled = 1;
                 }
             }
 
@@ -420,35 +514,61 @@ static void *ios_mach_exception_thread( void *arg )
     return NULL;
 }
 
-static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb )
+/* Register a Wine "process" thread with the shared Mach exception handler.
+ * First call creates the shared port and handler thread.
+ * Every call registers the thread and sets its exception ports. */
+static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
+                                               void *trampoline )
 {
-    extern struct _KUSER_SHARED_DATA *user_shared_data;
+    /* One-time initialization: create shared port and handler thread */
+    if (!ios_exc_handler_started)
+    {
+        extern struct _KUSER_SHARED_DATA *user_shared_data;
+        ios_exc_usd = (uintptr_t)user_shared_data;
 
-    ios_exc_teb = teb;
-    ios_exc_usd = (uintptr_t)user_shared_data;
+        kern_return_t kr = mach_port_allocate( mach_task_self(),
+                                                MACH_PORT_RIGHT_RECEIVE, &ios_exc_port );
+        if (kr != KERN_SUCCESS) { ERR("mach exc port allocate: kr=%d\n", kr); return; }
 
-    kern_return_t kr = mach_port_allocate( mach_task_self(),
-                                            MACH_PORT_RIGHT_RECEIVE, &ios_exc_port );
-    if (kr != KERN_SUCCESS) { ERR("mach exc port allocate: kr=%d\n", kr); return; }
+        kr = mach_port_insert_right( mach_task_self(), ios_exc_port, ios_exc_port,
+                                      MACH_MSG_TYPE_MAKE_SEND );
+        if (kr != KERN_SUCCESS) { ERR("mach exc port insert: kr=%d\n", kr); return; }
 
-    kr = mach_port_insert_right( mach_task_self(), ios_exc_port, ios_exc_port,
-                                  MACH_MSG_TYPE_MAKE_SEND );
-    if (kr != KERN_SUCCESS) { ERR("mach exc port insert: kr=%d\n", kr); return; }
+        pthread_t handler;
+        pthread_create( &handler, NULL, ios_mach_exception_thread,
+                        (void *)(uintptr_t)ios_exc_port );
+        pthread_detach( handler );
 
-    kr = thread_set_exception_ports( pe_thread,
+        ios_exc_handler_started = 1;
+    }
+
+    /* Register this thread in the registry */
+    int idx = __sync_fetch_and_add(&ios_thread_count, 1);
+    if (idx < IOS_MAX_WINE_THREADS)
+    {
+        ios_thread_registry[idx].mach_thread = pe_thread;
+        ios_thread_registry[idx].teb = teb;
+        ios_thread_registry[idx].trampoline = trampoline;
+        /* Store per-thread JIT mappings for the Mach handler */
+        {
+            extern void *ios_jit_get_thread_mappings(int *count_out);
+            int mc = 0;
+            void *mm = ios_jit_get_thread_mappings(&mc);
+            ios_thread_registry[idx].jit_mappings = mm;
+            ios_thread_registry[idx].jit_mapping_count = mc;
+        }
+    }
+
+    /* Set exception port for this thread (shared port) */
+    kern_return_t kr = thread_set_exception_ports( pe_thread,
                                       EXC_MASK_BAD_ACCESS,
                                       ios_exc_port,
                                       (exception_behavior_t)(EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES),
                                       ARM_THREAD_STATE64 );
-    if (kr != KERN_SUCCESS) { ERR("mach exc set ports: kr=%d\n", kr); return; }
+    if (kr != KERN_SUCCESS) { ERR("mach exc set ports: kr=%d thread=0x%x\n", kr, pe_thread); return; }
 
-    pthread_t handler;
-    pthread_create( &handler, NULL, ios_mach_exception_thread,
-                    (void *)(uintptr_t)ios_exc_port );
-    pthread_detach( handler );
-
-    ERR("Mach exception handler installed for thread 0x%x, teb=%p usd=%p\n",
-        pe_thread, (void*)teb, (void*)ios_exc_usd);
+    ERR("Mach exception handler registered thread 0x%x (idx=%d), teb=%p tramp=%p usd=%p\n",
+        pe_thread, idx, (void*)teb, trampoline, (void*)ios_exc_usd);
 }
 #endif
 
@@ -1348,9 +1468,8 @@ static inline void ios_fixup_x18_for_return( ucontext_t *context )
 {
     extern void *ios_jit_rx_base_global;
     extern size_t ios_jit_pool_size_global;
-    extern void *ios_jit_teb_trampoline;
 
-    if (!ios_jit_teb_trampoline || !ios_teb_for_signals) return;
+    if (!ios_my_trampoline || !ios_teb_for_signals) return;
 
     uintptr_t pc = PC_sig(context);
     uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
@@ -1359,7 +1478,7 @@ static inline void ios_fixup_x18_for_return( ucontext_t *context )
     if (rx && pc >= rx && pc < rx + sz)
     {
         REGn_sig(17, context) = pc;
-        PC_sig(context) = (uintptr_t)ios_jit_teb_trampoline;
+        PC_sig(context) = (uintptr_t)ios_my_trampoline;
     }
 }
 
@@ -1415,15 +1534,14 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         if (pc == siginfo->si_addr)
         {
             extern void *ios_jit_translate_addr(void *addr);
-            extern void *ios_jit_teb_trampoline;
             void *jit_pc = ios_jit_translate_addr(pc);
             if (jit_pc != pc)
             {
                 /* Use trampoline to set x18 (sigreturn zeroes it on iOS) */
-                if (ios_jit_teb_trampoline && ios_teb_for_signals)
+                if (ios_my_trampoline && ios_teb_for_signals)
                 {
                     REGn_sig(17, context) = (uintptr_t)jit_pc;
-                    PC_sig(context) = (uintptr_t)ios_jit_teb_trampoline;
+                    PC_sig(context) = (uintptr_t)ios_my_trampoline;
                 }
                 else
                 {
@@ -1463,14 +1581,13 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                         usd_fix_count++;
 
                         /* Also fix x18 if zeroed, and route through trampoline */
-                        extern void *ios_jit_teb_trampoline;
                         extern void *ios_jit_rw_base_global;
-                        if (REGn_sig(18, context) == 0 && ios_teb_for_signals)
+                        if (REGn_sig(18, context) == 0 && ios_teb_for_signals && ios_my_trampoline)
                         {
-                            if (ios_jit_rw_base_global)
-                                *(uint64_t *)ios_jit_rw_base_global = ios_teb_for_signals;
+                            if (ios_jit_rw_base_global && ios_my_slot >= 0)
+                                *(uint64_t *)((char *)ios_jit_rw_base_global + ios_my_slot * 16) = ios_teb_for_signals;
                             REGn_sig(17, context) = PC_sig(context);
-                            PC_sig(context) = (uintptr_t)ios_jit_teb_trampoline;
+                            PC_sig(context) = (uintptr_t)ios_my_trampoline;
                         }
                         return;
                     }
@@ -1491,12 +1608,11 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          * recomputed correctly on replay. */
         if (REGn_sig(18, context) == 0 && ios_teb_for_signals != 0)
         {
-            extern void *ios_jit_teb_trampoline;
             extern void *ios_jit_rw_base_global;
-            if (ios_jit_teb_trampoline)
+            if (ios_my_trampoline)
             {
-                if (ios_jit_rw_base_global)
-                    *(uint64_t *)ios_jit_rw_base_global = ios_teb_for_signals;
+                if (ios_jit_rw_base_global && ios_my_slot >= 0)
+                    *(uint64_t *)((char *)ios_jit_rw_base_global + ios_my_slot * 16) = ios_teb_for_signals;
 
                 uint64_t fault_pc = PC_sig(context);
                 uint64_t retry_pc = fault_pc;
@@ -1526,7 +1642,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                         (void*)ios_teb_for_signals);
                 }
                 REGn_sig(17, context) = retry_pc;
-                PC_sig(context) = (uintptr_t)ios_jit_teb_trampoline;
+                PC_sig(context) = (uintptr_t)ios_my_trampoline;
                 return;
             }
             /* Fallback: try direct restoration (may not work on iOS) */
@@ -1830,7 +1946,6 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     if (is_exec_fault)
     {
         extern void *ios_jit_translate_addr(void *addr);
-        extern void *ios_jit_teb_trampoline;
         extern int ios_jit_addr_is_text(uintptr_t addr);
         extern void *ios_jit_rx_base_global;
         extern size_t ios_jit_pool_size_global;
@@ -1839,10 +1954,10 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         if (jit_pc != pc)
         {
             /* Use trampoline to set x18 (sigreturn zeroes it on iOS) */
-            if (ios_jit_teb_trampoline && ios_teb_for_signals)
+            if (ios_my_trampoline && ios_teb_for_signals)
             {
                 REGn_sig(17, bus_ctx) = (uintptr_t)jit_pc;
-                PC_sig(bus_ctx) = (uintptr_t)ios_jit_teb_trampoline;
+                PC_sig(bus_ctx) = (uintptr_t)ios_my_trampoline;
             }
             else
             {
@@ -2244,6 +2359,33 @@ void signal_free_thread( TEB *teb )
 /**********************************************************************
  *		signal_init_process
  */
+#ifdef WINE_IOS
+/***********************************************************************
+ *           alrm_handler  (x18 periodic fixup)
+ *
+ * SIGALRM fires periodically to fix x18=0 caused by iOS context switches.
+ * The hardware zero page (0-0x1FFF) returns 0 for reads, so when x18=0,
+ * TEB/PEB accesses silently get wrong data instead of faulting.
+ * This timer-based approach catches x18=0 proactively.
+ */
+static void alrm_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+{
+    ucontext_t *context = sigcontext;
+
+    if (REGn_sig(18, context) == 0 && ios_teb_for_signals && ios_my_trampoline)
+    {
+        extern void *ios_jit_rw_base_global;
+        /* Write TEB to this thread's trampoline slot */
+        if (ios_jit_rw_base_global && ios_my_slot >= 0)
+            *(uint64_t *)((char *)ios_jit_rw_base_global + ios_my_slot * 16) = ios_teb_for_signals;
+
+        /* Redirect through trampoline to restore x18 after sigreturn */
+        REGn_sig(17, context) = PC_sig(context);
+        PC_sig(context) = (uintptr_t)ios_my_trampoline;
+    }
+}
+#endif
+
 void signal_init_process(void)
 {
     struct sigaction sig_act;
@@ -2277,6 +2419,7 @@ void signal_init_process(void)
     if (sigaction( SIGILL, &sig_act, NULL ) == -1) goto error;
     sig_act.sa_sigaction = bus_handler;
     if (sigaction( SIGBUS, &sig_act, NULL ) == -1) goto error;
+    /* SIGALRM handler kept but not registered — timer approach was too disruptive */
     return;
 
  error:
@@ -2382,10 +2525,18 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
 #ifdef WINE_IOS
     /* Save TEB for signal handler recovery */
     ios_teb_for_signals = (uintptr_t)teb;
-    /* Write TEB address into JIT pool trampoline */
+
+    /* Allocate per-thread trampoline slot in JIT pool */
     {
-        extern void ios_jit_set_teb(uintptr_t teb_addr);
-        ios_jit_set_teb((uintptr_t)teb);
+        extern int ios_jit_alloc_trampoline_slot(void);
+        extern void ios_jit_set_teb_slot(int slot, uintptr_t teb);
+        extern void *ios_jit_get_trampoline(int slot);
+
+        ios_my_slot = ios_jit_alloc_trampoline_slot();
+        ios_jit_set_teb_slot(ios_my_slot, (uintptr_t)teb);
+        ios_my_trampoline = ios_jit_get_trampoline(ios_my_slot);
+        ERR("init_syscall_frame: allocated trampoline slot %d, tramp=%p, teb=%p\n",
+            ios_my_slot, ios_my_trampoline, teb);
     }
 
     /* iOS x18 workaround: The kernel zeroes x18 on context switches.
@@ -2548,18 +2699,24 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
             ERR("ALL page0 mapping approaches FAILED — relying on SEGV trampoline only\n");
         }
     }
-    /* Install Mach exception handler for this thread.
-     * Handles x18=0 and user_shared_data without going through sigreturn. */
+    /* Register this thread with the shared Mach exception handler.
+     * First call creates the handler thread; all calls register the thread. */
     ios_setup_mach_exception_handler( pthread_mach_thread_np(pthread_self()),
-                                       (uintptr_t)teb );
-    /* Give the handler thread a moment to start */
-    usleep(10000);
-    ERR("init_syscall_frame: mach exc thread alive=%d\n", ios_exc_thread_alive);
+                                       (uintptr_t)teb, ios_my_trampoline );
+    /* Give the handler thread a moment to start (only needed for first thread) */
+    if (!ios_exc_thread_alive) usleep(10000);
+    ERR("init_syscall_frame: mach exc thread alive=%d, slot=%d\n",
+        ios_exc_thread_alive, ios_my_slot);
 
     ERR("init_syscall_frame: signals_total=%d before PE entry\n", ios_signal_total);
     ERR("init_syscall_frame: frame=%p pc=%p x0=%p sp=%p x18=%p restore_flags=0x%x\n",
         frame, (void*)(uintptr_t)frame->pc, (void*)(uintptr_t)frame->x[0],
         (void*)(uintptr_t)frame->sp, (void*)(uintptr_t)frame->x[18], frame->restore_flags);
+
+    /* Note: SIGALRM x18 watchdog was tried but is too disruptive (breaks
+     * PE code execution). The zero-page silent read issue remains — when
+     * x18=0, [x18+0x60] returns PEB=0 from the hardware zero page without
+     * faulting, so the Mach handler can't intervene. */
 #endif
 
     pthread_sigmask( SIG_UNBLOCK, &server_block_set, NULL );
@@ -2767,22 +2924,14 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "msr FPSR, x17\n"
                    "1:\tldp x16, x17, [sp, #0x100]\n\t"
                    "msr NZCV, x17\n\t"
-#ifdef WINE_IOS
-                   /* iOS zeroes x18 on sigreturn. Route through JIT pool
-                    * TEB trampoline: ldr x18,[pc,#-8]; br x17
-                    * x16 = target PC from frame. We need x17 = target for trampoline. */
-                   "ldp x30, x17, [sp, #0xf0]\n\t"
-                   "mov sp, x17\n\t"
-                   "mov x17, x16\n\t"            /* x17 = target PC */
-                   "adrp x16, " __ASM_NAME("ios_jit_teb_trampoline") "@PAGE\n\t"
-                   "ldr x16, [x16, " __ASM_NAME("ios_jit_teb_trampoline") "@PAGEOFF]\n\t"
-                   "br x16\n"                    /* → trampoline: sets x18, then br x17 */
-#else
+                   /* x18 was restored from frame->x[18] at label 2 above.
+                    * This path does NOT go through sigreturn, so x18 survives.
+                    * If a context switch zeroes x18 before PE code runs,
+                    * the Mach exception handler fixes it via per-thread trampoline. */
                    "ldp x30, x17, [sp, #0xf0]\n\t"
                    /* switch to user stack */
                    "mov sp, x17\n\t"
                    "ret x16\n"
-#endif
 
                    __ASM_LOCAL_LABEL("trace_syscall") ":\n\t"
                    "stp x0, x1, [sp, #-0x40]!\n\t"

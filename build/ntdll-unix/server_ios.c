@@ -156,8 +156,8 @@ BOOL process_exiting = FALSE;
 timeout_t server_start_time = 0;  /* time of server startup */
 
 sigset_t server_block_set;  /* signals to block during server calls */
-static int fd_socket = -1;  /* socket to exchange file descriptors with the server */
-static int initial_cwd = -1;
+static _Thread_local int fd_socket = -1;  /* per-Wine-process socket to exchange fds with server */
+static _Thread_local int initial_cwd = -1;
 static pid_t server_pid;
 pthread_mutex_t fd_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -332,6 +332,16 @@ static void read_reply_data( void *buffer, size_t size )
         if (!ret) break;
         if (errno == EINTR) continue;
         if (errno == EPIPE) break;
+#ifdef WINE_IOS
+        {
+            int bad_fd = ntdll_get_thread_data()->reply_fd;
+            void *teb = NtCurrentTeb();
+            uint64_t x18_val;
+            __asm__ volatile("mov %0, x18" : "=r"(x18_val));
+            dprintf(STDERR_FILENO, "[Wine FATAL] read_reply_data: reply_fd=%d teb=%p x18=0x%llx errno=%d fd_socket=%d\n",
+                    bad_fd, teb, (unsigned long long)x18_val, errno, fd_socket);
+        }
+#endif
         server_protocol_perror("read");
     }
     /* the server closed the connection; time to die... */
@@ -1130,8 +1140,31 @@ C_ASSERT( sizeof(union fd_cache_entry) == sizeof(LONG64) );
 #define FD_CACHE_BLOCK_SIZE  (65536 / sizeof(union fd_cache_entry))
 #define FD_CACHE_ENTRIES     128
 
+#ifdef WINE_IOS
+/* On iOS, Wine "processes" are threads sharing one address space.
+ * The fd cache must be per-Wine-process (thread-local) because handle
+ * values from different Wine processes can collide in the cache. */
+struct ios_fd_cache {
+    union fd_cache_entry *blocks[FD_CACHE_ENTRIES];
+    union fd_cache_entry initial_block[FD_CACHE_BLOCK_SIZE];
+};
+static _Thread_local struct ios_fd_cache *tl_fd_cache = NULL;
+
+static struct ios_fd_cache *ios_get_fd_cache(void)
+{
+    if (!tl_fd_cache)
+    {
+        tl_fd_cache = calloc( 1, sizeof(*tl_fd_cache) );
+    }
+    return tl_fd_cache;
+}
+
+#define fd_cache           (ios_get_fd_cache()->blocks)
+#define fd_cache_initial_block (ios_get_fd_cache()->initial_block)
+#else
 static union fd_cache_entry *fd_cache[FD_CACHE_ENTRIES];
 static union fd_cache_entry fd_cache_initial_block[FD_CACHE_BLOCK_SIZE];
+#endif
 
 static inline unsigned int handle_to_index( HANDLE handle, unsigned int *entry )
 {
@@ -1865,6 +1898,78 @@ size_t server_init_process(void)
 }
 
 
+#ifdef WINE_IOS
+/***********************************************************************
+ *           server_init_process_child  (iOS only)
+ *
+ * Streamlined version of server_init_process for child "processes"
+ * that are really threads. Takes the socketfd directly instead of
+ * reading WINESERVERSOCKET from the environment.
+ */
+size_t server_init_process_child( int child_fd_socket )
+{
+    struct ntdll_thread_data *data = ntdll_get_thread_data();
+    obj_handle_t version;
+    int ret, reply_pipe;
+    size_t info_size;
+    DWORD pid, tid;
+
+    /* Set the thread-local fd_socket for this child "process" */
+    fd_socket = child_fd_socket;
+    if (fcntl( fd_socket, F_SETFD, FD_CLOEXEC ) == -1)
+        wine_log_write("[Wine child] WARNING: fcntl FD_CLOEXEC failed on fd %d", fd_socket);
+
+    wine_log_write("[Wine child] server_init_process_child: fd_socket=%d", fd_socket);
+
+    /* Do NOT set up signal mask — already done by parent (shared process) */
+    /* Do NOT call setup_config_dir — already done by parent */
+
+    /* Receive request_fd from wineserver */
+    data->request_fd = wine_server_receive_fd( &version );
+    wine_log_write("[Wine child] got request_fd=%d, version=%d", data->request_fd, version);
+
+    if (version != SERVER_PROTOCOL_VERSION)
+        server_protocol_error( "version mismatch %d/%d\n", version, SERVER_PROTOCOL_VERSION );
+
+    reply_pipe = init_thread_pipe();
+
+    SERVER_START_REQ( init_first_thread )
+    {
+        req->unix_pid    = getpid();
+        req->unix_tid    = get_unix_tid();
+        req->reply_fd    = reply_pipe;
+        req->wait_fd     = data->wait_fd[1];
+        req->debug_level = (TRACE_ON(server) != 0);
+        wine_server_set_reply( req, supported_machines, sizeof(supported_machines) );
+        if (!(ret = wine_server_call( req )))
+        {
+            obj_handle_t handle;
+            pid       = reply->pid;
+            tid       = reply->tid;
+            info_size = reply->info_size;
+            if (reply->inproc_device)
+            {
+                int devfd = wine_server_receive_fd( &handle );
+                /* child doesn't need its own inproc device, close it */
+                if (devfd >= 0) close( devfd );
+            }
+        }
+    }
+    SERVER_END_REQ;
+    close( reply_pipe );
+
+    wine_log_write("[Wine child] init_first_thread ret=%d, pid=%d, tid=%d, info_size=%zu",
+                   ret, pid, tid, info_size);
+
+    if (ret) server_protocol_error( "init_first_thread (child) failed: %x\n", ret );
+
+    set_thread_id( NtCurrentTeb(), pid, tid );
+
+    return info_size;
+}
+#endif
+
+
 /***********************************************************************
  *           server_init_process_done
  */
@@ -1909,41 +2014,14 @@ void server_init_process_done(void)
     {
         extern void *pLdrInitializeThunk;
         extern void *pRtlUserThreadStart;
-        ERR("signal_start_thread: TransferAddress=%p pLdrInitializeThunk=%p pRtlUserThreadStart=%p suspend=%d\n",
-            main_image_info.TransferAddress, pLdrInitializeThunk, pRtlUserThreadStart, suspend);
-        ERR("signal_start_thread: peb=%p teb=%p\n", peb, NtCurrentTeb());
-        /* Check if LdrInitializeThunk is readable */
-        {
-            volatile unsigned char *p = (volatile unsigned char *)pLdrInitializeThunk;
-            unsigned char first_byte = *p;
-            ERR("signal_start_thread: LdrInitializeThunk first byte=0x%02x (readable OK)\n", first_byte);
-        }
-        /* Check memory protection via vm_region */
-        {
-            vm_address_t addr = (vm_address_t)pLdrInitializeThunk;
-            vm_size_t vmsize;
-            vm_region_basic_info_data_64_t info;
-            mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-            mach_port_t obj;
-            if (vm_region_64(mach_task_self(), &addr, &vmsize, VM_REGION_BASIC_INFO_64,
-                             (vm_region_info_t)&info, &count, &obj) == KERN_SUCCESS)
-            {
-                ERR("signal_start_thread: LdrInitializeThunk region: addr=%p size=0x%lx prot=%d/%d\n",
-                    (void*)addr, (unsigned long)vmsize, info.protection, info.max_protection);
-            }
-        }
-        ERR("signal_start_thread: about to jump to PE code (LdrInitializeThunk)...\n");
+        ERR("signal_start_thread: teb=%p peb=%p TransferAddress=%p suspend=%d\n",
+            NtCurrentTeb(), peb, main_image_info.TransferAddress, suspend);
 
-        /* Verify syscall dispatcher is set up in PE ntdll */
-        {
-            extern void __wine_syscall_dispatcher(void);
-            ERR("signal_start_thread: __wine_syscall_dispatcher (unix) = %p\n", __wine_syscall_dispatcher);
-        }
-
-        /* Watchdog: suspend thread and sample registers at 1s and 4s */
+        /* Watchdog: suspend thread and sample registers at 2s and 4s */
         {
             pthread_t wine_pthread = pthread_self();
             mach_port_t wine_mach_thread = pthread_mach_thread_np(wine_pthread);
+            uint64_t watchdog_teb_addr = (uint64_t)(uintptr_t)NtCurrentTeb();
 
             void (^sample_thread)(int secs) = ^(int secs) {
                 int kill_ret = pthread_kill(wine_pthread, 0);
@@ -1980,12 +2058,19 @@ void server_init_process_done(void)
                         (unsigned long long)g_wine_return_pc,
                         (unsigned long long)g_wine_return_count);
 
+                    /* Mach handler stats */
+                    {
+                        extern volatile int64_t ios_exc_x18_fixes;
+                        extern volatile int ios_exc_msg_count;
+                        wine_log_write("[Wine WATCHDOG %ds] mach: msgs=%d x18_fixes=%lld",
+                            secs, ios_exc_msg_count, (long long)ios_exc_x18_fixes);
+                    }
+
                     /* If x18=0, read the syscall frame from memory to check frame->x[18] */
                     if (state.__x[18] == 0) {
-                        /* TEB is at 0xfbffe0000 (from init_syscall_frame log).
-                         * thread_data->syscall_frame is at TEB+0x378.
+                        /* thread_data->syscall_frame is at TEB+0x378.
                          * frame->x[18] is at frame+0x90. */
-                        uint64_t teb_addr = 0xfbffe0000ULL;
+                        uint64_t teb_addr = watchdog_teb_addr;
                         uint64_t frame_ptr = 0;
                         /* Read syscall_frame pointer from TEB+0x378 */
                         vm_size_t out_size = sizeof(frame_ptr);

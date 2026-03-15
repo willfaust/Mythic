@@ -1064,16 +1064,9 @@ void main_loop(void)
 
             ios_iter++;
             /* Heartbeat via ws_log (file-based, not stderr) */
-            if (ios_iter % 500 == 0)
+            if (ios_iter % 50000 == 0)
             {
                 ws_log("[wineserver-fd] iter=%d act=%d nb=%d ef=%d", ios_iter, active_users, nb_users, ios_events_fired);
-                /* Dump all fds for debugging */
-                for (i = 0; i < nb_users && i < 15; i++)
-                {
-                    int ba = -1;
-                    if (pollfd[i].fd >= 0) ioctl(pollfd[i].fd, FIONREAD, &ba);
-                    ws_log("[wineserver-fd]   [%d] fd=%d ev=0x%x bytes=%d", i, pollfd[i].fd, pollfd[i].events, ba);
-                }
             }
 
             /* Check for injected client fd (socketpair bypass) */

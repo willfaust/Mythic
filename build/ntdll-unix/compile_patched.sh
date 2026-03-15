@@ -44,12 +44,14 @@ echo "=== Compiling patched files ==="
 compile_one "$BUILD_DIR/loader_ios.c" "loader.o"
 compile_one "$BUILD_DIR/process_ios.c" "process.o"
 compile_one "$BUILD_DIR/server_ios.c" "server.o"
+compile_one "$BUILD_DIR/virtual_ios.c" "virtual.o"
+compile_one "$BUILD_DIR/signal_arm64_ios.c" "signal_arm64.o"
 
 echo ""
 echo "=== Rebuilding libntdll_unix.a ==="
 # Update existing archive with recompiled objects
 if [ -f "$OBJ_DIR/libntdll_unix.a" ]; then
-    for obj in loader.o process.o server.o; do
+    for obj in loader.o process.o server.o virtual.o signal_arm64.o; do
         ar d "$OBJ_DIR/libntdll_unix.a" "$obj" 2>/dev/null || true
         ar r "$OBJ_DIR/libntdll_unix.a" "$OBJ_DIR/$obj"
     done

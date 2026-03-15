@@ -60,6 +60,11 @@
 # include <mach/mach.h>
 #endif
 
+#ifdef WINE_IOS
+#include <pthread.h>
+#include <setjmp.h>
+#endif
+
 #include "ntstatus.h"
 #include "windef.h"
 #include "winternl.h"
@@ -400,13 +405,104 @@ static BOOL is_unix_console_handle( HANDLE handle )
 /***********************************************************************
  *           spawn_process
  */
+#ifdef WINE_IOS
+/* Child process thread entry point */
+extern void wine_ios_child_main( int argc, char *argv[], int child_fd_socket );
+
+/* Thread-local exit handling (from wine_ios_exit.h) */
+extern _Thread_local jmp_buf wine_ios_exit_jmpbuf;
+extern _Thread_local volatile int wine_ios_exit_code;
+extern _Thread_local pthread_t wine_ios_main_thread;
+extern _Thread_local int wine_ios_exit_initialized;
+
+struct ios_child_args {
+    int socketfd;
+    int unixdir;
+    char **argv;
+    int argc;
+    struct pe_image_info pe_info;
+};
+
+static void *ios_child_thread_entry( void *arg )
+{
+    struct ios_child_args *args = arg;
+
+    /* Use dprintf for early logging — ERR requires TEB which isn't set up yet */
+    dprintf(STDERR_FILENO, "[Wine child thread] ENTRY: fd=%d, argc=%d, exe=%s\n",
+            args->socketfd, args->argc, args->argc > 1 ? args->argv[1] : "(none)");
+
+    /* Set up exit handling for this child thread */
+    wine_ios_main_thread = pthread_self();
+    wine_ios_exit_initialized = 1;
+
+    if (setjmp(wine_ios_exit_jmpbuf) == 0) {
+        /* Change working directory if requested */
+        if (args->unixdir != -1) {
+            fchdir( args->unixdir );
+            close( args->unixdir );
+        }
+
+        dprintf(STDERR_FILENO, "[Wine child thread] calling wine_ios_child_main...\n");
+        wine_ios_child_main( args->argc, args->argv, args->socketfd );
+        /* Should not return */
+        dprintf(STDERR_FILENO, "[Wine child thread] wine_ios_child_main returned unexpectedly!\n");
+    } else {
+        dprintf(STDERR_FILENO, "[Wine child thread] child exited with code %d\n", wine_ios_exit_code);
+    }
+
+    dprintf(STDERR_FILENO, "[Wine child thread] thread exiting cleanly\n");
+    free( args->argv );
+    free( args );
+    return NULL;
+}
+#endif
+
 static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int socketfd,
                                int unixdir, char *winedebug, const struct pe_image_info *pe_info )
 {
 #ifdef WINE_IOS
-    /* No fork on iOS */
-    ERR("spawn_process: BLOCKED (no fork on iOS)\n");
-    return STATUS_NOT_SUPPORTED;
+    /* iOS: create a thread instead of fork+exec */
+    char **argv;
+    struct ios_child_args *args;
+    pthread_t child_thread;
+    int ret, argc;
+
+    argv = build_argv( &params->CommandLine, 2 );
+    if (!argv) return STATUS_NO_MEMORY;
+
+    /* argv[0] and argv[1] are reserved for preloader/loader — set them */
+    argv[0] = (char *)"wine";
+    argv[1] = (char *)"wine";
+
+    /* Count argc */
+    for (argc = 0; argv[argc]; argc++);
+
+    args = calloc( 1, sizeof(*args) );
+    if (!args) { free( argv ); return STATUS_NO_MEMORY; }
+
+    /* dup the socketfd — parent will close the original after we return */
+    args->socketfd = dup( socketfd );
+    /* dup the unixdir — parent will also close the original (iOS shares fd table) */
+    args->unixdir = (unixdir != -1) ? dup( unixdir ) : -1;
+    args->argv = argv;
+    args->argc = argc;
+    args->pe_info = *pe_info;
+
+    if (winedebug) putenv( winedebug );
+
+    ERR("spawn_process: creating child thread for %s (fd=%d, unixdir=%d, dup_unixdir=%d)\n",
+        debugstr_us(&params->CommandLine), socketfd, unixdir, args->unixdir);
+
+    ret = pthread_create( &child_thread, NULL, ios_child_thread_entry, args );
+    if (ret) {
+        ERR("spawn_process: pthread_create failed: %d\n", ret);
+        free( argv );
+        free( args );
+        return STATUS_NO_MEMORY;
+    }
+    pthread_detach( child_thread );
+
+    return STATUS_SUCCESS;
 #else
     NTSTATUS status = STATUS_SUCCESS;
     int stdin_fd = -1, stdout_fd = -1;

@@ -1340,6 +1340,12 @@ NTSTATUS load_builtin( const struct pe_image_info *image_info, UNICODE_STRING *n
                        void **module, SIZE_T *size, ULONG_PTR limit_low, ULONG_PTR limit_high,
                        off_t offset )
 {
+#ifdef WINE_IOS
+    /* On iOS, all PE DLLs are in the prefix (system32 symlinks to bundle).
+     * Skip the builtin .so search — it causes mmap failures on iOS and
+     * corrupts file descriptors.  Just tell the caller to use the PE file. */
+    return STATUS_IMAGE_ALREADY_LOADED;
+#else
     NTSTATUS status;
     USHORT search_machine = image_info->machine;
     enum loadorder loadorder = get_load_order( nt_name );
@@ -1376,6 +1382,7 @@ NTSTATUS load_builtin( const struct pe_image_info *image_info, UNICODE_STRING *n
             return STATUS_IMAGE_ALREADY_LOADED;
         return status;
     }
+#endif
 }
 
 
@@ -1520,7 +1527,8 @@ static NTSTATUS open_main_image( UNICODE_STRING *nt_name, void **module, SECTION
     if (loadorder == LO_DISABLED) NtTerminateProcess( GetCurrentProcess(), STATUS_DLL_NOT_FOUND );
 
     InitializeObjectAttributes( &attr, nt_name, OBJ_CASE_INSENSITIVE, 0, NULL );
-    if (get_nt_and_unix_names( &attr, &true_nt_name, &unix_name, FILE_OPEN, FALSE )) return STATUS_DLL_NOT_FOUND;
+    if (get_nt_and_unix_names( &attr, &true_nt_name, &unix_name, FILE_OPEN, FALSE ))
+        return STATUS_DLL_NOT_FOUND;
 
     status = open_dll_file( unix_name, &attr, &mapping );
     if (!status)
@@ -1558,8 +1566,10 @@ NTSTATUS load_main_exe( UNICODE_STRING *nt_name, USHORT load_machine, void **mod
 
     /* if path is in system dir, we can load the builtin even if the file itself doesn't exist */
     if (loadorder != LO_NATIVE && is_builtin_path( nt_name, &search_machine ))
+    {
         status = find_builtin_dll( nt_name, NULL, module, &size, &main_image_info, 0, 0,
                                    search_machine, load_machine, FALSE, 0 );
+    }
     return status;
 }
 
@@ -2363,6 +2373,110 @@ static void check_command_line( int argc, char *argv[] )
 
     reexec_loader( argc, argv, NULL );
 }
+
+
+#ifdef WINE_IOS
+/***********************************************************************
+ *           wine_ios_child_main
+ *
+ * Entry point for child Wine "processes" on iOS.
+ * Instead of fork+exec, the parent creates a thread that calls this.
+ * Does a minimal subset of __wine_main/start_main_thread init.
+ */
+extern size_t server_init_process_child( int child_fd_socket );
+
+DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_socket )
+{
+    TEB *teb;
+    PEB *child_peb;
+    NTSTATUS status;
+
+    dprintf(STDERR_FILENO, "[Wine child] wine_ios_child_main: argc=%d argv[1]=%s fd=%d\n",
+            argc, argc > 1 ? argv[1] : "(none)", child_fd_socket);
+
+    /* Allocate a new TEB for this child "process" thread */
+    status = virtual_alloc_teb( &teb );
+    if (status) {
+        dprintf(STDERR_FILENO, "[Wine child] virtual_alloc_teb FAILED: 0x%x\n", status);
+        return;
+    }
+
+    /* Allocate a SEPARATE PEB for this child "process".
+     * Without this, parent and child share peb->Ldr (module list),
+     * causing corruption when both PE loaders modify it. */
+    child_peb = mmap( NULL, 0x4000, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANON, -1, 0 );
+    if (child_peb == MAP_FAILED) {
+        dprintf(STDERR_FILENO, "[Wine child] PEB mmap FAILED: errno=%d\n", errno);
+        return;
+    }
+    /* Copy parent PEB fields (OS version, heap params, etc.) */
+    memcpy( child_peb, peb, sizeof(PEB) );
+    /* Clear fields that must be per-process */
+    child_peb->LdrData = NULL;            /* PE-side LdrInitializeThunk will create this */
+    child_peb->ImageBaseAddress = NULL;    /* set by init_startup_info */
+    child_peb->ProcessParameters = NULL;  /* set by init_startup_info */
+    /* Point child's TEB to the new PEB */
+    teb->Peb = child_peb;
+
+    dprintf(STDERR_FILENO, "[Wine child] teb=%p child_peb=%p (parent_peb=%p)\n",
+            teb, child_peb, peb);
+
+    /* Set TEB key so NtCurrentTeb() works on this thread */
+    pthread_setspecific( teb_key, teb );
+
+    /* Switch global peb to child's PEB for the duration of child init.
+     * The parent thread is blocked in NtWaitForSingleObject at this point. */
+    {
+        PEB *parent_peb = peb;
+        peb = child_peb;
+
+        /* Set up main_argc/argv for this child (these are globals, but parent is blocked) */
+        main_argc = argc;
+        main_argv = argv;
+
+        /* Register with wineserver using the child's socketfd */
+        startup_info_size = server_init_process_child( child_fd_socket );
+
+        /* init_startup_info — reads startup info from wineserver, loads the child's PE */
+        init_startup_info();
+        dprintf(STDERR_FILENO, "[Wine child] PE loaded: Machine=0x%x TransferAddress=%p ImageBase=%p\n",
+                main_image_info.Machine, main_image_info.TransferAddress, peb->ImageBaseAddress);
+
+        /* Set DLL load order for child's exe */
+        *(ULONG_PTR *)&peb->CloudFileFlags = get_image_address();
+        set_load_order_app_name( main_wargv[0] );
+
+        /* Set up thread stack */
+        init_thread_stack( teb, 0, 0, 0 );
+
+        /* Create SEPARATE copies of shared PE DLLs in the JIT pool for the child.
+         * Parent and child can't share ntdll's .data section — they have
+         * independent loader state (module lists, hash tables, etc.).
+         * Each child gets fully independent copies with their own .data. */
+        {
+            extern int ios_jit_copy_all_for_child(void);
+            int copies = ios_jit_copy_all_for_child();
+            dprintf(STDERR_FILENO, "[Wine child] created %d independent PE copies in JIT pool\n", copies);
+        }
+
+        /* Keep peb = child_peb through server_init_process_done, because:
+         * 1. server_init_process_done sends PEB address to wineserver
+         * 2. It calls signal_start_thread which never returns
+         * The parent thread is blocked in NtWaitForSingleObject during this time.
+         * After PE code starts, peb stays as child_peb on this thread.
+         * The parent will unblock and its PE code uses NtCurrentTeb()->Peb (correct).
+         * Note: parent's unix-side peb references may see child_peb, but after
+         * init there are very few unix-side peb references. */
+        (void)parent_peb;  /* suppress unused warning */
+    }
+
+    /* Finalize init and enter PE code (calls signal_start_thread, never returns) */
+    server_init_process_done();
+
+    /* Never reaches here — server_init_process_done calls signal_start_thread */
+}
+#endif
 
 
 /***********************************************************************
