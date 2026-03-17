@@ -115,14 +115,7 @@ struct ios_jit_mapping {
     unsigned int reloc_size;/* Size of .reloc data */
 };
 static struct ios_jit_mapping ios_jit_mappings[IOS_JIT_MAX_MAPPINGS];
-int ios_jit_mapping_count = 0;
-
-/* Per-thread mapping overrides for child "process" threads.
- * When set, ios_jit_translate_addr checks these FIRST.
- * The child's copies of parent DLLs go here so the child
- * uses its own .data sections while the parent keeps its own. */
-static __thread struct ios_jit_mapping *ios_thread_mappings = NULL;
-static __thread int ios_thread_mapping_count = 0;
+static int ios_jit_mapping_count = 0;
 
 /* Exported JIT pool addresses for use by SIGBUS handler in signal_arm64_ios.c */
 void *ios_jit_rx_base_global = NULL;
@@ -239,18 +232,6 @@ void ios_jit_set_text_section(void *pe_base, size_t text_offset, size_t text_siz
 int ios_jit_addr_is_text(uintptr_t addr)
 {
     int i;
-    /* Check per-thread mappings first */
-    if (ios_thread_mappings)
-    {
-        for (i = 0; i < ios_thread_mapping_count; i++)
-        {
-            uintptr_t jit_base = (uintptr_t)ios_thread_mappings[i].jit_base;
-            size_t t_off = ios_thread_mappings[i].text_offset;
-            size_t t_sz  = ios_thread_mappings[i].text_size;
-            if (t_sz && addr >= jit_base + t_off && addr < jit_base + t_off + t_sz)
-                return 1;
-        }
-    }
     for (i = 0; i < ios_jit_mapping_count; i++)
     {
         uintptr_t jit_base = (uintptr_t)ios_jit_mappings[i].jit_base;
@@ -283,25 +264,12 @@ void ios_jit_set_teb(uintptr_t teb)
     }
 }
 
-/* Translate a PE address to JIT pool address. Returns original if not mapped.
- * Checks per-thread overrides first (for child processes). */
+/* Translate a PE address to JIT pool address. Returns original if not mapped. */
 void *ios_jit_translate_addr(void *addr)
 {
     int i;
     uintptr_t a = (uintptr_t)addr;
 
-    /* Check per-thread overrides first (child process copies) */
-    if (ios_thread_mappings)
-    {
-        for (i = 0; i < ios_thread_mapping_count; i++)
-        {
-            uintptr_t base = (uintptr_t)ios_thread_mappings[i].pe_base;
-            if (a >= base && a < base + ios_thread_mappings[i].size)
-                return (void *)((uintptr_t)ios_thread_mappings[i].jit_base + (a - base));
-        }
-    }
-
-    /* Fall back to global mappings */
     for (i = 0; i < ios_jit_mapping_count; i++)
     {
         uintptr_t base = (uintptr_t)ios_jit_mappings[i].pe_base;
@@ -309,32 +277,6 @@ void *ios_jit_translate_addr(void *addr)
             return (void *)((uintptr_t)ios_jit_mappings[i].jit_base + (a - base));
     }
     return addr;  /* Not in any mapping */
-}
-
-/* Get the current thread's per-thread JIT mapping overrides */
-void *ios_jit_get_thread_mappings(int *count_out)
-{
-    if (count_out) *count_out = ios_thread_mapping_count;
-    return ios_thread_mappings;
-}
-
-/* Translate using explicit override mappings (for Mach handler on non-faulting thread) */
-void *ios_jit_translate_addr_with_overrides(void *addr, void *overrides, int override_count)
-{
-    struct ios_jit_mapping *maps = overrides;
-    uintptr_t a = (uintptr_t)addr;
-    int i;
-    if (maps)
-    {
-        for (i = 0; i < override_count; i++)
-        {
-            uintptr_t base = (uintptr_t)maps[i].pe_base;
-            if (a >= base && a < base + maps[i].size)
-                return (void *)((uintptr_t)maps[i].jit_base + (a - base));
-        }
-    }
-    /* Fall back to global */
-    return ios_jit_translate_addr(addr);
 }
 
 /* Reverse-translate a JIT pool address back to the original PE address.
@@ -360,6 +302,8 @@ void *ios_jit_reverse_translate_addr(const void *addr)
 void ios_jit_sync_write(void *addr, size_t size)
 {
     int i;
+    uintptr_t a = (uintptr_t)addr;
+
     for (i = 0; i < ios_jit_mapping_count; i++)
     {
         uintptr_t a = (uintptr_t)addr;
@@ -379,155 +323,251 @@ void ios_jit_sync_write(void *addr, size_t size)
     }
 }
 
-/* Create a child-specific copy of a PE image in the JIT pool.
- * The child gets its own .text and .data — fully independent from the parent.
- * The new copy is added to the calling thread's per-thread mapping override,
- * so the child's Mach/signal handlers redirect to the child's copy.
- * Returns 0 on success, -1 on failure. */
-int ios_jit_copy_for_child(void *pe_base)
+/***********************************************************************
+ *           ios_jit_patch_x18  (x18 → TPIDR_EL0 binary patcher)
+ *
+ * Scans a PE .text section for all ARM64 instructions that reference x18
+ * and replaces each with a branch to a generated trampoline.
+ * The trampoline reads TEB from TPIDR_EL0 (preserved by iOS across context
+ * switches, unlike x18) and performs the original operation.
+ *
+ * This eliminates the "zero-page silent read" problem entirely — patched
+ * code never touches x18, so iOS zeroing it has no effect.
+ */
+
+/* Check if an ARM64 instruction references x18 as a register operand.
+ * Returns the role (which field contains x18) or 0 if no x18 reference. */
+#define X18_ROLE_NONE 0
+#define X18_ROLE_RN   1  /* bits[9:5] = base register for loads/stores/data-proc */
+#define X18_ROLE_RM   2  /* bits[20:16] = second register (MOV, register offset) */
+#define X18_ROLE_RT2  3  /* bits[14:10] = second register in LDP/STP */
+
+static int ios_insn_x18_role(uint32_t insn)
 {
-    int i;
-    for (i = 0; i < ios_jit_mapping_count; i++)
+    /* Quick reject: check if 18 appears in any relevant field */
+    int rn = (insn >> 5) & 0x1f;
+    int rm = (insn >> 16) & 0x1f;
+    int rt2 = (insn >> 10) & 0x1f;
+    if (rn != 18 && rm != 18 && rt2 != 18) return X18_ROLE_NONE;
+
+    /* Classify instruction to verify the field is actually a register */
+    uint32_t top8 = insn >> 24;
+    uint32_t top11 = insn >> 21;
+
+    /* LDR/STR (unsigned immediate) — top2=1x, [27:24]=x111, [29]=1 */
+    if ((top8 & 0x3F) == 0x39 || (top8 & 0x3F) == 0x3D ||  /* 0b0011 1001, 0b0011 1101 */
+        (top8 & 0x3F) == 0xB9 || (top8 & 0x3F) == 0xBD ||  /* 0b1011 1001, 0b1011 1101 */
+        (top8 & 0x3F) == 0xF9 || (top8 & 0x3F) == 0xFD ||  /* 0b1111 1001, 0b1111 1101 */
+        (top8 & 0x3F) == 0x79 || (top8 & 0x3F) == 0x7D)    /* 0b0111 1001, 0b0111 1101 */
     {
-        if (ios_jit_mappings[i].pe_base != pe_base) continue;
-
-        size_t img_sz = ios_jit_mappings[i].size;
-        size_t page_size = 0x4000;
-        size_t alloc_size = (img_sz + page_size - 1) & ~(page_size - 1);
-
-        /* Allocate from JIT pool */
-        static size_t jit_pool_offset_child = 0;
-        if (!jit_pool_offset_child)
-        {
-            /* Find current pool usage from the last global mapping */
-            for (int k = 0; k < ios_jit_mapping_count; k++)
-            {
-                size_t end = (uintptr_t)ios_jit_mappings[k].jit_base
-                           - (uintptr_t)ios_jit_rx_base_global
-                           + ios_jit_mappings[k].size;
-                end = (end + page_size - 1) & ~(page_size - 1);
-                if (end > jit_pool_offset_child) jit_pool_offset_child = end;
-            }
-        }
-
-        size_t offset = __sync_fetch_and_add(&jit_pool_offset_child, alloc_size);
-        if (offset + alloc_size > ios_jit_pool_size_global)
-        {
-            ERR("ios_jit_copy_for_child: out of JIT pool space! need 0x%lx at 0x%lx\n",
-                (unsigned long)alloc_size, (unsigned long)offset);
-            return -1;
-        }
-
-        char *rw_dest = (char *)ios_jit_rw_base_global + offset;
-        char *rx_dest = (char *)ios_jit_rx_base_global + offset;
-
-        /* Copy entire PE image from unix mapping (original PE file data).
-         * Do NOT copy .text from parent's JIT pool — ADRP instructions are
-         * PC-relative and would point to the parent's .data, not the child's.
-         * The original PE .text has correct PC-relative layout for this copy. */
-        memcpy(rw_dest, pe_base, img_sz);
-
-        /* Apply DIR64 relocations to ALL sections (including .text).
-         * The original PE file has unrelocated absolute pointers. */
-        intptr_t delta = (intptr_t)rx_dest - (intptr_t)ios_jit_mappings[i].pe_image_base;
-        if (ios_jit_mappings[i].reloc_rva && ios_jit_mappings[i].reloc_size)
-        {
-            char *reloc = rw_dest + ios_jit_mappings[i].reloc_rva;
-            char *reloc_end = reloc + ios_jit_mappings[i].reloc_size;
-            int fixups = 0;
-
-            while (reloc < reloc_end)
-            {
-                unsigned int page_rva = *(unsigned int *)reloc;
-                unsigned int block_size = *(unsigned int *)(reloc + 4);
-                unsigned short *entries = (unsigned short *)(reloc + 8);
-                int num_entries = (block_size - 8) / 2;
-
-                for (int j = 0; j < num_entries; j++)
-                {
-                    int type = entries[j] >> 12;
-                    int off = entries[j] & 0xFFF;
-                    if (type == 10)  /* IMAGE_REL_BASED_DIR64 */
-                    {
-                        unsigned int rva = page_rva + off;
-                        uint64_t *ptr = (uint64_t *)(rw_dest + rva);
-                        *ptr += delta;
-                        fixups++;
-                    }
-                }
-                reloc += block_size;
-                if (block_size == 0) break;
-            }
-            ERR("  child copy: %d DIR64 fixups (delta=0x%lx)\n", fixups, (unsigned long)delta);
-        }
-
-        /* Make .data sections writable */
-        /* Parse PE sections to find writable ones */
-        {
-            unsigned int pe_off = *(unsigned int *)((char *)pe_base + 0x3c);
-            unsigned short num_sec = *(unsigned short *)((char *)pe_base + pe_off + 6);
-            unsigned short opt_sz = *(unsigned short *)((char *)pe_base + pe_off + 20);
-            char *sec = (char *)pe_base + pe_off + 24 + opt_sz;
-            for (int s = 0; s < num_sec; s++, sec += 40)
-            {
-                unsigned int chars = *(unsigned int *)(sec + 36);
-                unsigned int sec_rva = *(unsigned int *)(sec + 12);
-                unsigned int sec_sz = *(unsigned int *)(sec + 8);
-                if (chars & 0x80000000)  /* IMAGE_SCN_MEM_WRITE */
-                {
-                    size_t p_off = (sec_rva) & ~(page_size - 1);
-                    size_t p_sz = ((sec_rva + sec_sz + page_size - 1) & ~(page_size - 1)) - p_off;
-                    mprotect(rx_dest + p_off, p_sz, PROT_READ | PROT_WRITE);
-                }
-            }
-        }
-
-        sys_icache_invalidate(rx_dest, alloc_size);
-
-        /* Add to per-thread mapping override */
-        if (!ios_thread_mappings)
-        {
-            ios_thread_mappings = calloc(IOS_JIT_MAX_MAPPINGS, sizeof(struct ios_jit_mapping));
-            ios_thread_mapping_count = 0;
-        }
-        if (ios_thread_mapping_count < IOS_JIT_MAX_MAPPINGS)
-        {
-            int idx = ios_thread_mapping_count++;
-            ios_thread_mappings[idx].pe_base = pe_base;
-            ios_thread_mappings[idx].jit_base = rx_dest;
-            ios_thread_mappings[idx].size = img_sz;
-            ios_thread_mappings[idx].text_offset = ios_jit_mappings[i].text_offset;
-            ios_thread_mappings[idx].text_size = ios_jit_mappings[i].text_size;
-            ios_thread_mappings[idx].pe_image_base = ios_jit_mappings[i].pe_image_base;
-            ios_thread_mappings[idx].reloc_delta = delta;
-            ios_thread_mappings[idx].reloc_rva = ios_jit_mappings[i].reloc_rva;
-            ios_thread_mappings[idx].reloc_size = ios_jit_mappings[i].reloc_size;
-        }
-
-        ERR("ios_jit_copy_for_child: pe=%p → pool offset 0x%lx (rx=%p), size=0x%lx\n",
-            pe_base, (unsigned long)offset, rx_dest, (unsigned long)img_sz);
-        return 0;
+        if (rn == 18) return X18_ROLE_RN;
     }
-    ERR("ios_jit_copy_for_child: pe_base=%p not found!\n", pe_base);
-    return -1;
+
+    /* LDR/STR (register offset) — [31:21]=1x111000xx1, [11:10]=10 */
+    if ((top11 & 0x3E7) == 0x1C1 && ((insn >> 10) & 3) == 2)
+    {
+        if (rn == 18) return X18_ROLE_RN;
+        if (rm == 18) return X18_ROLE_RM;
+    }
+
+    /* LDR/STR (pre/post-indexed) — [31:21]=1x111000xx0 */
+    if ((top11 & 0x3E7) == 0x1C0)
+    {
+        if (rn == 18) return X18_ROLE_RN;
+    }
+
+    /* LDP/STP (signed offset, pre/post-indexed) — [31:25]=x0101x01 or x0101x00 */
+    if ((top8 & 0x3E) == 0x28 || (top8 & 0x3E) == 0x2C ||  /* x010 100x, x010 110x */
+        (top8 & 0x3E) == 0xA8 || (top8 & 0x3E) == 0xAC ||  /* 1010 100x, 1010 110x */
+        (top8 & 0x3E) == 0x68 || (top8 & 0x3E) == 0x6C)    /* 0110 100x, 0110 110x */
+    {
+        if (rn == 18) return X18_ROLE_RN;
+        if (rt2 == 18) return X18_ROLE_RT2;
+    }
+
+    /* MOV (register) = ORR Rd, XZR, Rm — [31:21]=x01 0101 0000 */
+    if ((top11 & 0x7FF) == 0x150 || (top11 & 0x7FF) == 0x550)
+    {
+        if (rm == 18) return X18_ROLE_RM;
+    }
+
+    /* ADD/SUB (immediate) — [31:24]=x00 10001 or x10 10001 */
+    if ((top8 & 0x5F) == 0x11)
+    {
+        if (rn == 18) return X18_ROLE_RN;
+    }
+
+    /* ADD/SUB (register) — [31:24]=x00 01011 or x10 01011 */
+    if ((top8 & 0x5F) == 0x0B)
+    {
+        if (rn == 18) return X18_ROLE_RN;
+        if (rm == 18) return X18_ROLE_RM;
+    }
+
+    return X18_ROLE_NONE;
 }
 
-/* Copy all shared PE DLLs for the child. Returns number of copies made. */
-int ios_jit_copy_all_for_child(void)
+/* Replace x18 in an instruction with a different register */
+static uint32_t ios_insn_replace_x18(uint32_t insn, int role, int scratch)
 {
-    int i, copies = 0;
-    for (i = 0; i < ios_jit_mapping_count; i++)
+    switch (role)
     {
-        if (ios_jit_mappings[i].text_size > 0 && ios_jit_mappings[i].size >= 0x10000)
+    case X18_ROLE_RN:  return (insn & ~(0x1f << 5)) | (scratch << 5);
+    case X18_ROLE_RM:  return (insn & ~(0x1f << 16)) | (scratch << 16);
+    case X18_ROLE_RT2: return (insn & ~(0x1f << 10)) | (scratch << 10);
+    default:           return insn;
+    }
+}
+
+/* Patch all x18 references in a PE .text section.
+ * text_rw/text_rx: RW and RX views of the .text section
+ * text_size: size of .text in bytes
+ * tramp_rw/tramp_rx: RW and RX views of the trampoline area
+ * tramp_size: available space for trampolines
+ * Returns number of instructions patched. */
+int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
+                       char *tramp_rw, char *tramp_rx, size_t tramp_size)
+{
+    size_t tramp_off = 0;
+    int count = 0;
+    int skipped = 0;
+
+    for (size_t i = 0; i < text_size; i += 4)
+    {
+        uint32_t insn = *(uint32_t *)(text_rw + i);
+        int role = ios_insn_x18_role(insn);
+        if (role == X18_ROLE_NONE) continue;
+
+        /* Determine scratch register — use x17 normally.
+         * Avoid conflicts with instruction's other register operands. */
+        int scratch = 17;
+        int rt = insn & 0x1f;
+        int rn = (insn >> 5) & 0x1f;
+        int rm = (insn >> 16) & 0x1f;
+        if (rt == 17 || rn == 17 || rm == 17) scratch = 16;
+        /* Double-check: if both x16 and x17 are used, skip (extremely rare) */
+        if (scratch == 16 && (rt == 16 || rn == 16 || rm == 16))
         {
-            ERR("copy_all_for_child: mapping %d pe=%p size=0x%lx\n",
-                i, ios_jit_mappings[i].pe_base, (unsigned long)ios_jit_mappings[i].size);
-            if (ios_jit_copy_for_child(ios_jit_mappings[i].pe_base) == 0)
-                copies++;
+            skipped++;
+            continue;
+        }
+
+        /* Check trampoline space (max 6 instructions = 24 bytes per trampoline) */
+        if (tramp_off + 24 > tramp_size)
+        {
+            ERR("x18 patcher: out of trampoline space at %d patches\n", count);
+            break;
+        }
+
+        uintptr_t insn_rx = (uintptr_t)(text_rx + i);
+        uintptr_t tramp_rx_addr = (uintptr_t)(tramp_rx + tramp_off);
+        uintptr_t return_rx = insn_rx + 4;
+
+        /* TEB load sequence (3 instructions, uses TPIDRRO_EL0 which iOS preserves):
+         *   mrs xSCRATCH, TPIDRRO_EL0
+         *   and xSCRATCH, xSCRATCH, #~7   (clear CPU number from low 3 bits)
+         *   ldr xSCRATCH, [xSCRATCH, #SLOT_OFFSET]  (load TEB from TLS slot)
+         */
+        extern int ios_teb_tls_slot_offset;
+        int slot_off = ios_teb_tls_slot_offset;
+
+        /* Check if this is MOV xN, x18 (special case — load TEB directly into dest) */
+        int is_mov_from_x18 = (role == X18_ROLE_RM) &&
+            ((insn & 0xFFE0FFE0) == 0xAA0003E0) && rm == 18;
+
+        if (is_mov_from_x18)
+        {
+            int rd = insn & 0x1f;
+            /* mrs xRd, TPIDRRO_EL0 */
+            *(uint32_t *)(tramp_rw + tramp_off) = 0xD53BD060 | rd;
+            tramp_off += 4;
+            /* and xRd, xRd, #~7 (immediate: 0xFFFFFFFFFFFFFFF8 = immr=0 imms=0x3C) */
+            *(uint32_t *)(tramp_rw + tramp_off) = 0x927DF000 | (rd << 5) | rd;
+            tramp_off += 4;
+            /* ldr xRd, [xRd, #slot_off] */
+            *(uint32_t *)(tramp_rw + tramp_off) = 0xF9400000 | ((slot_off / 8) << 10) | (rd << 5) | rd;
+            tramp_off += 4;
+        }
+        else
+        {
+            /* Check trampoline space (7 instructions = 28 bytes) */
+            if (tramp_off + 32 > tramp_size)
+            {
+                ERR("x18 patcher: out of trampoline space at %d patches\n", count);
+                break;
+            }
+            /* str xSCRATCH, [sp, #-16]! */
+            *(uint32_t *)(tramp_rw + tramp_off) = (scratch == 17) ? 0xF81F0FF1 : 0xF81F0FF0;
+            tramp_off += 4;
+            /* mrs xSCRATCH, TPIDRRO_EL0 */
+            *(uint32_t *)(tramp_rw + tramp_off) = 0xD53BD060 | scratch;
+            tramp_off += 4;
+            /* and xSCRATCH, xSCRATCH, #~7 */
+            *(uint32_t *)(tramp_rw + tramp_off) = 0x927DF000 | (scratch << 5) | scratch;
+            tramp_off += 4;
+            /* ldr xSCRATCH, [xSCRATCH, #slot_off] */
+            *(uint32_t *)(tramp_rw + tramp_off) = 0xF9400000 | ((slot_off / 8) << 10) | (scratch << 5) | scratch;
+            tramp_off += 4;
+            /* Modified instruction with x18 replaced by scratch */
+            *(uint32_t *)(tramp_rw + tramp_off) = ios_insn_replace_x18(insn, role, scratch);
+            tramp_off += 4;
+            /* ldr xSCRATCH, [sp], #16 */
+            *(uint32_t *)(tramp_rw + tramp_off) = (scratch == 17) ? 0xF84107F1 : 0xF84107F0;
+            tramp_off += 4;
+        }
+
+        /* Branch back to return address */
+        intptr_t ret_delta = (intptr_t)return_rx - (intptr_t)(tramp_rx + tramp_off);
+        *(uint32_t *)(tramp_rw + tramp_off) = 0x14000000 | ((ret_delta >> 2) & 0x3FFFFFF);
+        tramp_off += 4;
+
+        /* Patch original instruction: B <trampoline> */
+        intptr_t fwd_delta = (intptr_t)tramp_rx_addr - (intptr_t)insn_rx;
+        uint32_t b_insn = 0x14000000 | ((fwd_delta >> 2) & 0x3FFFFFF);
+        *(uint32_t *)(text_rw + i) = b_insn;
+
+        if (count < 2)
+        {
+            ERR("  patch[%d]: text+0x%lx orig=0x%08x → B 0x%08x delta=%ld slot_off=0x%x\n",
+                count, (unsigned long)i, insn, b_insn, (long)fwd_delta, slot_off);
+            /* Dump first trampoline instructions */
+            size_t t_start = tramp_off - (is_mov_from_x18 ? 12 : 24) - 4; /* back to start */
+            for (int d = 0; d <= (is_mov_from_x18 ? 3 : 6); d++)
+                ERR("    tramp[%d]=0x%08x\n", d, *(uint32_t *)(tramp_rw + t_start + d * 4));
+        }
+
+        count++;
+    }
+
+    if (count > 0 || skipped > 0)
+        ERR("x18 patcher: patched %d instructions (%d skipped), trampolines=%lu bytes\n",
+            count, skipped, (unsigned long)tramp_off);
+
+    /* Verify: log first patched instruction's encoding */
+    if (count > 0)
+    {
+        for (size_t i = 0; i < text_size; i += 4)
+        {
+            uint32_t insn = *(uint32_t *)(text_rw + i);
+            if ((insn >> 26) == 5)  /* found a B instruction (our patch) */
+            {
+                int32_t imm26 = (int32_t)(insn & 0x3FFFFFF);
+                if (imm26 & 0x2000000) imm26 |= (int32_t)0xFC000000;
+                intptr_t delta = (intptr_t)imm26 << 2;
+                ERR("  verify: text+0x%lx insn=0x%08x B delta=%ld target=%p tramp_rx=%p\n",
+                    (unsigned long)i, insn, (long)delta,
+                    (void*)((uintptr_t)(text_rx + i) + delta), (void*)tramp_rx);
+                /* Check first trampoline instruction */
+                ERR("  tramp[0]=0x%08x tramp[1]=0x%08x\n",
+                    *(uint32_t *)tramp_rw, *(uint32_t *)(tramp_rw + 4));
+                break;
+            }
         }
     }
-    return copies;
+
+    return count;
 }
+
 #endif
 
 struct preload_info
@@ -1287,6 +1327,11 @@ static NTSTATUS get_unixlib_funcs( void *so_handle, BOOL wow, const void **funcs
 /***********************************************************************
  *           load_builtin_unixlib
  */
+#ifdef WINE_IOS
+static NTSTATUS ios_stub_unix_call(void *args) {
+    return STATUS_NOT_SUPPORTED;
+}
+#endif
 static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs )
 {
     NTSTATUS (*entry)(void) = NULL;
@@ -1307,6 +1352,17 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
     }
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
     if (!status && entry) status = entry();
+#ifdef WINE_IOS
+    /* On iOS, unix .so files aren't available for most DLLs.
+     * Return success so DllMain doesn't abort. The PE DLL will work
+     * but unix calls will fail at runtime (STATUS_NOT_SUPPORTED). */
+    if (status == STATUS_DLL_NOT_FOUND)
+    {
+        *funcs = (const void *)ios_stub_unix_call;
+        WARN_(module)("iOS: no unix .so for module %p, using stub\n", module);
+        status = STATUS_SUCCESS;
+    }
+#endif
     return status;
 }
 
@@ -2666,6 +2722,52 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                         uint64_t rw_val = *(uint64_t *)(rw_image + 0x64a68);
                         ERR("iOS JIT:   syscall_dispatcher ptr relocated to 0x%llx\n",
                             (unsigned long long)rw_val);
+                    }
+                }
+
+                /* Patch x18 references in .text → TPIDR_EL0 trampolines.
+                 * Allocate trampoline space right after the PE image in the JIT pool. */
+                {
+                    /* Find .text section info from mapping table */
+                    int map_idx;
+                    size_t text_off = 0, text_sz = 0;
+                    for (map_idx = 0; map_idx < ios_jit_mapping_count; map_idx++)
+                    {
+                        if (ios_jit_mappings[map_idx].pe_base == image_base)
+                        {
+                            text_off = ios_jit_mappings[map_idx].text_offset;
+                            text_sz = ios_jit_mappings[map_idx].text_size;
+                            break;
+                        }
+                    }
+                    if (text_sz > 0)
+                    {
+                        /* Allocate trampoline space: ~24 bytes per x18 ref, estimate ~1% of .text */
+                        size_t tramp_budget = text_sz;  /* generous: same size as .text */
+                        size_t tramp_alloc = (tramp_budget + page_size - 1) & ~(page_size - 1);
+                        size_t tramp_pool_off = __sync_fetch_and_add(&jit_pool_offset, tramp_alloc);
+
+                        if (tramp_pool_off + tramp_alloc <= jit_pool_size)
+                        {
+                            char *tramp_rw = (char *)jit_rw_base + tramp_pool_off;
+                            char *tramp_rx = (char *)jit_rx_base + tramp_pool_off;
+                            char *text_rw = (char *)jit_rw_base + offset + text_off;
+                            char *text_rx = (char *)jit_rx_base + offset + text_off;
+
+                            int patched = ios_jit_patch_x18(text_rw, text_rx, text_sz,
+                                                            tramp_rw, tramp_rx, tramp_alloc);
+
+                            if (patched > 0)
+                            {
+                                sys_icache_invalidate(text_rx, text_sz);
+                                sys_icache_invalidate(tramp_rx, tramp_alloc);
+                            }
+                        }
+                        else
+                        {
+                            ERR("iOS JIT: no space for x18 trampolines (need 0x%lx at 0x%lx)\n",
+                                (unsigned long)tramp_alloc, (unsigned long)tramp_pool_off);
+                        }
                     }
                 }
             }

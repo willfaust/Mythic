@@ -2011,6 +2011,15 @@ void server_init_process_done(void)
 
     assert( !status );
 #ifdef WINE_IOS
+    /* On iOS, the parent's PE code (CreateProcessInternalW) should call
+     * NtResumeThread to unsuspend the child. But since we use thread-based
+     * CreateProcess, the resume mechanism may not work correctly.
+     * Force suspend=0 so the child proceeds immediately. */
+    if (suspend)
+    {
+        dprintf(STDERR_FILENO, "[Wine init_done] overriding suspend=%d → 0 for iOS\n", suspend);
+        suspend = 0;
+    }
     {
         extern void *pLdrInitializeThunk;
         extern void *pRtlUserThreadStart;

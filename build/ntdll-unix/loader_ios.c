@@ -1071,8 +1071,6 @@ volatile uint64_t g_wine_unix_call_count = 0;
 static NTSTATUS ios_wrap_unix_call(int index, void *args, unixlib_entry_t real_func)
 {
     g_wine_unix_call_count++;
-    if (g_wine_unix_call_count <= 10 || (g_wine_unix_call_count % 50) == 0)
-        ERR("unix_call[%d] count=%llu\n", index, (unsigned long long)g_wine_unix_call_count);
     return real_func(args);
 }
 
@@ -2000,6 +1998,48 @@ static void start_main_thread(void)
     TEB *teb = virtual_alloc_first_teb();
     WINE_IOS_LOG("virtual_alloc_first_teb done");
 
+#ifdef WINE_IOS
+    /* Create TLS key for TEB storage BEFORE any PE loading.
+     * The x18 binary patcher needs ios_teb_tls_slot_offset when generating
+     * trampolines during mprotect_exec, which happens during load_ntdll. */
+    {
+        extern pthread_key_t ios_teb_tls_key;
+        extern int ios_teb_tls_slot_offset;
+        extern int ios_teb_tls_key_created;
+        if (!ios_teb_tls_key_created)
+        {
+            pthread_key_create(&ios_teb_tls_key, NULL);
+            ios_teb_tls_key_created = 1;
+        }
+        /* Store TEB in the slot so we can find its offset */
+        pthread_setspecific(ios_teb_tls_key, teb);
+        /* Compute raw TSD slot offset from TPIDRRO_EL0 */
+        uintptr_t tsd_base;
+        __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
+        tsd_base &= ~7ULL;
+        for (int s = 0; s < 512; s++)
+        {
+            if (*(void **)(tsd_base + s * 8) == teb)
+            {
+                ios_teb_tls_slot_offset = s * 8;
+                WINE_IOS_LOG("TEB TLS slot found");
+                dprintf(STDERR_FILENO, "[Wine init] TEB at TSD slot %d (offset 0x%x) tsd_base=%p teb=%p\n",
+                        s, s * 8, (void*)tsd_base, teb);
+                /* Verify readback: simulate what the trampoline does */
+                {
+                    uintptr_t verify_base;
+                    __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(verify_base));
+                    verify_base &= ~7ULL;
+                    void *readback = *(void **)(verify_base + s * 8);
+                    dprintf(STDERR_FILENO, "[Wine init] TRAMPOLINE VERIFY: tpidrro_raw=%p masked=%p slot[%d]=%p expected=%p %s\n",
+                            (void*)verify_base, (void*)verify_base, s, readback, teb,
+                            readback == teb ? "OK" : "MISMATCH!");
+                }
+                break;
+            }
+        }
+    }
+#endif
     WINE_IOS_LOG("signal_init_threading...");
     signal_init_threading();
     WINE_IOS_LOG("dbg_init...");
@@ -2410,12 +2450,14 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
         dprintf(STDERR_FILENO, "[Wine child] PEB mmap FAILED: errno=%d\n", errno);
         return;
     }
-    /* Copy parent PEB fields (OS version, heap params, etc.) */
+    /* Copy parent PEB — share heap, locks, etc. Clear LdrData so the child's
+     * LdrInitializeThunk builds a fresh module list instead of traversing
+     * the parent's (which crashes due to x18=0 zero-page corruption).
+     * With shared JIT pool (same addresses), __ulock_wait works correctly. */
     memcpy( child_peb, peb, sizeof(PEB) );
-    /* Clear fields that must be per-process */
-    child_peb->LdrData = NULL;            /* PE-side LdrInitializeThunk will create this */
+    child_peb->LdrData = NULL;            /* child builds fresh module list */
     child_peb->ImageBaseAddress = NULL;    /* set by init_startup_info */
-    child_peb->ProcessParameters = NULL;  /* set by init_startup_info */
+    child_peb->ProcessParameters = NULL;   /* set by init_startup_info */
     /* Point child's TEB to the new PEB */
     teb->Peb = child_peb;
 
@@ -2424,6 +2466,12 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
 
     /* Set TEB key so NtCurrentTeb() works on this thread */
     pthread_setspecific( teb_key, teb );
+
+    /* Store TEB in patcher TLS slot so TPIDRRO_EL0-based trampolines work */
+    {
+        extern pthread_key_t ios_teb_tls_key;
+        pthread_setspecific( ios_teb_tls_key, teb );
+    }
 
     /* Switch global peb to child's PEB for the duration of child init.
      * The parent thread is blocked in NtWaitForSingleObject at this point. */
@@ -2450,15 +2498,10 @@ DECLSPEC_EXPORT void wine_ios_child_main( int argc, char *argv[], int child_fd_s
         /* Set up thread stack */
         init_thread_stack( teb, 0, 0, 0 );
 
-        /* Create SEPARATE copies of shared PE DLLs in the JIT pool for the child.
-         * Parent and child can't share ntdll's .data section — they have
-         * independent loader state (module lists, hash tables, etc.).
-         * Each child gets fully independent copies with their own .data. */
-        {
-            extern int ios_jit_copy_all_for_child(void);
-            int copies = ios_jit_copy_all_for_child();
-            dprintf(STDERR_FILENO, "[Wine child] created %d independent PE copies in JIT pool\n", copies);
-        }
+        /* Share parent's JIT pool PE copies — no separate copies.
+         * The child uses the same ntdll .text/.data as the parent.
+         * This avoids __ulock_wait address mismatch and saves JIT pool space. */
+        dprintf(STDERR_FILENO, "[Wine child] sharing parent's JIT pool copies\n");
 
         /* Keep peb = child_peb through server_init_process_done, because:
          * 1. server_init_process_done sends PEB address to wineserver

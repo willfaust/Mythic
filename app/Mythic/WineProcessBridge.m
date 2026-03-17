@@ -58,7 +58,7 @@ static void *wine_process_thread(void *arg) {
         }
 
         // Debug output
-        setenv("WINEDEBUG", "err+all,fixme+all,warn+module,trace+process", 1);
+        setenv("WINEDEBUG", "err+all,fixme+all,warn+module,trace+process,trace+module,trace+loaddll", 1);
 
         LOG("WINEPREFIX=%{public}s", g_prefix_path);
 
@@ -106,8 +106,8 @@ static void *wine_process_thread(void *arg) {
 
         // Call Wine's main entry point
         // argv[0] = "wine", argv[1] = program to run
-        char *argv[] = { "wine", "C:\\windows\\system32\\start.exe", "/wait", "cmd.exe", NULL };
-        int argc = 4;
+        char *argv[] = { "wine", "C:\\windows\\system32\\wineboot.exe", "--init", NULL };
+        int argc = 3;
 
         // Record this thread so wine_ios_exit knows where to longjmp
         wine_ios_main_thread = pthread_self();

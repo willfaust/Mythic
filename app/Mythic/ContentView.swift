@@ -393,7 +393,7 @@ struct ContentView: View {
             // Step 4: Wait for Wine to finish instead of fixed timer
             // Poll wine_process_is_running() — it clears when __wine_main returns
             logStore.log("Waiting for Wine to finish PE loading...")
-            let maxWait = 30.0  // safety cap
+            let maxWait = 60.0  // safety cap
             let pollStart = CFAbsoluteTimeGetCurrent()
             while wine_process_is_running() != 0 {
                 Thread.sleep(forTimeInterval: 0.25)

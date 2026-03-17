@@ -219,6 +219,11 @@ volatile int ios_total_segv_count = 0;
 /* TEB backup for signal handler x18 restoration */
 static __thread uintptr_t ios_teb_for_signals = 0;
 
+/* TLS key for storing TEB, accessible via TPIDRRO_EL0 in patched PE code */
+pthread_key_t ios_teb_tls_key = 0;
+int ios_teb_tls_slot_offset = 0;  /* byte offset from TPIDRRO_EL0 base to TEB slot */
+int ios_teb_tls_key_created = 0;
+
 /*
  * Per-thread Mach exception handler for EXC_BAD_ACCESS.
  * ONE handler thread serves ALL Wine "process" threads.
@@ -244,22 +249,16 @@ static __thread int ios_my_slot = -1;
 
 /* Thread registry: maps Mach thread port → TEB + trampoline */
 #define IOS_MAX_WINE_THREADS 64
-/* Forward declarations for per-thread JIT mappings */
-extern void *ios_jit_translate_addr_with_overrides(void *addr, void *overrides, int override_count);
-extern int ios_jit_addr_is_text_with_overrides(uintptr_t addr, void *overrides, int override_count);
 
 struct ios_thread_entry {
     thread_t mach_thread;
     uintptr_t teb;
     void *trampoline;
-    void *jit_mappings;     /* per-thread JIT mapping overrides (struct ios_jit_mapping *) */
-    int jit_mapping_count;  /* number of per-thread overrides */
 };
 static struct ios_thread_entry ios_thread_registry[IOS_MAX_WINE_THREADS];
 static volatile int32_t ios_thread_count = 0;
 
-static int ios_lookup_thread(thread_t mach_thread, uintptr_t *teb_out, void **tramp_out,
-                             void **mappings_out, int *mapping_count_out)
+static int ios_lookup_thread(thread_t mach_thread, uintptr_t *teb_out, void **tramp_out)
 {
     int count = __sync_fetch_and_add(&ios_thread_count, 0);
     for (int i = 0; i < count; i++)
@@ -268,8 +267,6 @@ static int ios_lookup_thread(thread_t mach_thread, uintptr_t *teb_out, void **tr
         {
             *teb_out = ios_thread_registry[i].teb;
             *tramp_out = ios_thread_registry[i].trampoline;
-            if (mappings_out) *mappings_out = ios_thread_registry[i].jit_mappings;
-            if (mapping_count_out) *mapping_count_out = ios_thread_registry[i].jit_mapping_count;
             return 1;
         }
     }
@@ -278,14 +275,10 @@ static int ios_lookup_thread(thread_t mach_thread, uintptr_t *teb_out, void **tr
     {
         *teb_out = ios_thread_registry[0].teb;
         *tramp_out = ios_thread_registry[0].trampoline;
-        if (mappings_out) *mappings_out = NULL;
-        if (mapping_count_out) *mapping_count_out = 0;
         return 1;
     }
     *teb_out = 0;
     *tramp_out = NULL;
-    if (mappings_out) *mappings_out = NULL;
-    if (mapping_count_out) *mapping_count_out = 0;
     return 0;
 }
 
@@ -327,34 +320,6 @@ typedef struct {
 } ios_exc_reply_t;
 #pragma pack()
 
-/* Proactively fix x18=0 on all registered PE threads.
- * Called from the Mach handler thread on timer timeout.
- * Uses thread_suspend/get_state/set_state/resume — no signals involved. */
-static void ios_poll_fix_x18(void)
-{
-    int count = __sync_fetch_and_add(&ios_thread_count, 0);
-    for (int i = 0; i < count; i++)
-    {
-        thread_t t = ios_thread_registry[i].mach_thread;
-        uintptr_t teb = ios_thread_registry[i].teb;
-        if (!teb) continue;
-
-        kern_return_t kr = thread_suspend(t);
-        if (kr != KERN_SUCCESS) continue;
-
-        arm_thread_state64_t state;
-        mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
-        kr = thread_get_state(t, ARM_THREAD_STATE64, (thread_state_t)&state, &sc);
-        if (kr == KERN_SUCCESS && state.__x[18] == 0)
-        {
-            state.__x[18] = teb;
-            thread_set_state(t, ARM_THREAD_STATE64, (thread_state_t)&state, sc);
-            ios_exc_x18_fixes++;
-        }
-        thread_resume(t);
-    }
-}
-
 static void *ios_mach_exception_thread( void *arg )
 {
     mach_port_t port = (mach_port_t)(uintptr_t)arg;
@@ -382,13 +347,10 @@ static void *ios_mach_exception_thread( void *arg )
         thread_t thread = req->thread.name;
         int handled = 0;
 
-        /* Look up per-thread TEB, trampoline, and JIT mappings for the faulting thread */
+        /* Look up per-thread TEB and trampoline for the faulting thread */
         uintptr_t thread_teb = 0;
         void *thread_trampoline = NULL;
-        void *thread_jit_mappings = NULL;
-        int thread_jit_mapping_count = 0;
-        ios_lookup_thread( thread, &thread_teb, &thread_trampoline,
-                          &thread_jit_mappings, &thread_jit_mapping_count );
+        ios_lookup_thread( thread, &thread_teb, &thread_trampoline );
 
         /* Get faulting thread's register state */
         arm_thread_state64_t state;
@@ -441,15 +403,8 @@ static void *ios_mach_exception_thread( void *arg )
                     }
                     else
                     {
-                        /* Exec fault OUTSIDE JIT pool — try to translate to JIT equivalent.
-                         * Use per-thread mappings if available (child process). */
-                        void *jit_pc;
-                        if (thread_jit_mappings && thread_jit_mapping_count > 0)
-                            jit_pc = ios_jit_translate_addr_with_overrides(
-                                (void *)(uintptr_t)fault_pc,
-                                thread_jit_mappings, thread_jit_mapping_count);
-                        else
-                            jit_pc = ios_jit_translate_addr((void *)(uintptr_t)fault_pc);
+                        /* Exec fault OUTSIDE JIT pool — try to translate to JIT equivalent. */
+                        void *jit_pc = ios_jit_translate_addr((void *)(uintptr_t)fault_pc);
                         if (jit_pc != (void *)(uintptr_t)fault_pc)
                         {
                             if (thread_teb && state.__x[18] == 0)
@@ -549,14 +504,6 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
         ios_thread_registry[idx].mach_thread = pe_thread;
         ios_thread_registry[idx].teb = teb;
         ios_thread_registry[idx].trampoline = trampoline;
-        /* Store per-thread JIT mappings for the Mach handler */
-        {
-            extern void *ios_jit_get_thread_mappings(int *count_out);
-            int mc = 0;
-            void *mm = ios_jit_get_thread_mappings(&mc);
-            ios_thread_registry[idx].jit_mappings = mm;
-            ios_thread_registry[idx].jit_mapping_count = mc;
-        }
     }
 
     /* Set exception port for this thread (shared port) */
@@ -1595,57 +1542,12 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             }
         }
 
-        /* If x18 is 0 and we have TEB backup, this is a TEB access fault.
-         * iOS kernel zeroes x18 (platform register) on context switches.
-         * When x18=0 and page 0 is readable, [x18+offset] silently returns
-         * wrong data instead of faulting. Registers derived from these bad
-         * reads get corrupted before a SEGV eventually fires at some
-         * unrelated-looking address.
-         *
-         * Fix: scan backward up to 64 instructions to find the EARLIEST
-         * x18 usage. Redirect through the TEB trampoline to retry from
-         * that point with x18 correctly set. All derived registers get
-         * recomputed correctly on replay. */
+        /* If x18 is 0 and we have TEB backup, restore it directly.
+         * iOS kernel zeroes x18 (platform register) on signal delivery.
+         * The binary patcher is the real fix (rewrites x18 refs to use
+         * a safe TEB load sequence). This is just a simple fallback. */
         if (REGn_sig(18, context) == 0 && ios_teb_for_signals != 0)
         {
-            extern void *ios_jit_rw_base_global;
-            if (ios_my_trampoline)
-            {
-                if (ios_jit_rw_base_global && ios_my_slot >= 0)
-                    *(uint64_t *)((char *)ios_jit_rw_base_global + ios_my_slot * 16) = ios_teb_for_signals;
-
-                uint64_t fault_pc = PC_sig(context);
-                uint64_t retry_pc = fault_pc;
-
-                /* Scan backward up to 64 instructions to find the earliest
-                 * x18 usage. Check Rn (bits[9:5]) and Rm (bits[20:16]).
-                 * Don't stop at first non-x18 instruction — the dependency
-                 * chain may have non-x18 instructions between x18 reads
-                 * and the eventual fault. */
-                for (int scan = 1; scan <= 64; scan++)
-                {
-                    uint32_t insn = *(uint32_t*)(fault_pc - scan * 4);
-                    int rn = (insn >> 5) & 0x1f;
-                    int rm = (insn >> 16) & 0x1f;
-                    if (rn == 18 || rm == 18) {
-                        retry_pc = fault_pc - scan * 4;
-                        /* Keep scanning to find even earlier x18 usage */
-                    }
-                }
-
-                if (segv_dump_count < 10)
-                {
-                    segv_dump_count++;
-                    ERR("SEGV x18=0: pc=%p addr=%p retry=%p (-%d insns) teb=%p\n",
-                        pc, siginfo->si_addr, (void*)retry_pc,
-                        (int)((fault_pc - retry_pc) / 4),
-                        (void*)ios_teb_for_signals);
-                }
-                REGn_sig(17, context) = retry_pc;
-                PC_sig(context) = (uintptr_t)ios_my_trampoline;
-                return;
-            }
-            /* Fallback: try direct restoration (may not work on iOS) */
             REGn_sig(18, context) = ios_teb_for_signals;
             return;
         }
@@ -1653,7 +1555,12 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         if (segv_dump_count < 20)
         {
             segv_dump_count++;
-            ERR("SEGV at pc=%p addr=%p esr=0x%llx\n", pc, siginfo->si_addr, (unsigned long long)esr);
+            /* Check TPIDR_EL0 — should hold TEB if binary patcher is working */
+            uint64_t tpidr_el0;
+            __asm__ volatile("mrs %0, TPIDR_EL0" : "=r"(tpidr_el0));
+            ERR("SEGV at pc=%p addr=%p esr=0x%llx TPIDR_EL0=%p (expected %p)\n",
+                pc, siginfo->si_addr, (unsigned long long)esr,
+                (void*)tpidr_el0, (void*)ios_teb_for_signals);
             ERR("  x0=%p x1=%p x2=%p x3=%p\n",
                 (void*)REGn_sig(0, context), (void*)REGn_sig(1, context),
                 (void*)REGn_sig(2, context), (void*)REGn_sig(3, context));
@@ -2359,33 +2266,6 @@ void signal_free_thread( TEB *teb )
 /**********************************************************************
  *		signal_init_process
  */
-#ifdef WINE_IOS
-/***********************************************************************
- *           alrm_handler  (x18 periodic fixup)
- *
- * SIGALRM fires periodically to fix x18=0 caused by iOS context switches.
- * The hardware zero page (0-0x1FFF) returns 0 for reads, so when x18=0,
- * TEB/PEB accesses silently get wrong data instead of faulting.
- * This timer-based approach catches x18=0 proactively.
- */
-static void alrm_handler( int signal, siginfo_t *siginfo, void *sigcontext )
-{
-    ucontext_t *context = sigcontext;
-
-    if (REGn_sig(18, context) == 0 && ios_teb_for_signals && ios_my_trampoline)
-    {
-        extern void *ios_jit_rw_base_global;
-        /* Write TEB to this thread's trampoline slot */
-        if (ios_jit_rw_base_global && ios_my_slot >= 0)
-            *(uint64_t *)((char *)ios_jit_rw_base_global + ios_my_slot * 16) = ios_teb_for_signals;
-
-        /* Redirect through trampoline to restore x18 after sigreturn */
-        REGn_sig(17, context) = PC_sig(context);
-        PC_sig(context) = (uintptr_t)ios_my_trampoline;
-    }
-}
-#endif
-
 void signal_init_process(void)
 {
     struct sigaction sig_act;
@@ -2395,6 +2275,15 @@ void signal_init_process(void)
     thread_data->syscall_frame = (struct syscall_frame *)kernel_stack - 1;
 
     signal_alloc_thread( NtCurrentTeb() );
+
+#ifdef WINE_IOS
+    /* Create TLS key for TEB storage (used by x18 binary patcher trampolines) */
+    if (!ios_teb_tls_key_created)
+    {
+        pthread_key_create(&ios_teb_tls_key, NULL);
+        ios_teb_tls_key_created = 1;
+    }
+#endif
 
     sig_act.sa_mask = server_block_set;
     sig_act.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
@@ -2419,7 +2308,6 @@ void signal_init_process(void)
     if (sigaction( SIGILL, &sig_act, NULL ) == -1) goto error;
     sig_act.sa_sigaction = bus_handler;
     if (sigaction( SIGBUS, &sig_act, NULL ) == -1) goto error;
-    /* SIGALRM handler kept but not registered — timer approach was too disruptive */
     return;
 
  error:
@@ -2526,6 +2414,33 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
     /* Save TEB for signal handler recovery */
     ios_teb_for_signals = (uintptr_t)teb;
 
+    /* Store TEB in pthread TLS slot — accessible via TPIDRRO_EL0 which
+     * iOS preserves across context switches. TPIDR_EL0 is NOT safe (iOS zeros it).
+     * The x18 binary patcher rewrites PE code to read TEB from this TLS slot. */
+    {
+        extern pthread_key_t ios_teb_tls_key;
+        extern int ios_teb_tls_slot_offset;
+        pthread_setspecific(ios_teb_tls_key, teb);
+        /* Also compute the raw TSD slot offset for the patcher's trampolines */
+        if (ios_teb_tls_slot_offset == 0)
+        {
+            uintptr_t tsd_base;
+            __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
+            tsd_base &= ~7ULL;
+            /* Find our TEB in the TSD array */
+            for (int s = 0; s < 512; s++)
+            {
+                if (*(void **)(tsd_base + s * 8) == teb)
+                {
+                    ios_teb_tls_slot_offset = s * 8;
+                    ERR("init_syscall_frame: TEB at TSD slot %d (offset 0x%x from TPIDRRO_EL0)\n",
+                        s, ios_teb_tls_slot_offset);
+                    break;
+                }
+            }
+        }
+    }
+
     /* Allocate per-thread trampoline slot in JIT pool */
     {
         extern int ios_jit_alloc_trampoline_slot(void);
@@ -2552,8 +2467,8 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
      * Solution: CREATE a VM mapping at address 0 containing TEB data.
      * This overrides the hardware zero-page behavior. When x18=0,
      * [x18+offset] reads real TEB data from our mapping.
-     * If all mapping approaches fail, use SIGALRM watchdog to
-     * periodically restore x18 on the PE thread. */
+     * If all mapping approaches fail, the Mach exception handler
+     * is the last resort for x18 restoration. */
     {
         kern_return_t kr;
         int mapped = 0;
@@ -2695,8 +2610,38 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
             ERR("page0 post-map: region=%p size=0x%llx prot=%d/%d\n",
                 (void*)region_addr, (unsigned long long)region_size,
                 rinfo.protection, rinfo.max_protection);
-        } else {
-            ERR("ALL page0 mapping approaches FAILED — relying on SEGV trampoline only\n");
+        }
+
+        /* M8: Ask the debugger to write TEB data to page 0 via BRK #0xf00d cmd 3.
+         * The debugger may have kernel privileges that the app doesn't.
+         * Uses GDB M (memory write) command to write TEB data at address 0. */
+        if (!mapped) {
+            ERR("page0: trying debugger (BRK #0xf00d, x16=3)...\n");
+            register uintptr_t x0_val __asm__("x0") = (uintptr_t)teb;
+            register size_t x1_val __asm__("x1") = 0x4000;
+            register uintptr_t x0_result __asm__("x0");
+            __asm__ volatile(
+                "mov x16, #3\n"
+                "brk #0xf00d\n"
+                : "=r"(x0_result)
+                : "r"(x0_val), "r"(x1_val)
+                : "x16", "memory"
+            );
+            ERR("page0 M8 debugger: result=%lu\n", (unsigned long)x0_result);
+            if (x0_result == 1) {
+                /* Verify: read PEB from address 0+offset */
+                uintptr_t teb_off = (uintptr_t)teb - ((uintptr_t)teb & ~0x3FFFULL);
+                uint64_t peb0 = *(volatile uint64_t *)(teb_off + 0x60);
+                uint64_t peb_real = *(volatile uint64_t *)((uintptr_t)teb + 0x60);
+                ERR("page0 M8 verify: peb@0x%lx=%p real=%p %s\n",
+                    (unsigned long)(teb_off + 0x60), (void*)peb0, (void*)peb_real,
+                    peb0 == peb_real ? "MATCH" : "MISMATCH");
+                if (peb0 == peb_real) mapped = 8;
+            }
+        }
+
+        if (!mapped) {
+            ERR("ALL page0 mapping approaches FAILED (including debugger) — relying on Mach handler only\n");
         }
     }
     /* Register this thread with the shared Mach exception handler.
@@ -2713,10 +2658,10 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
         frame, (void*)(uintptr_t)frame->pc, (void*)(uintptr_t)frame->x[0],
         (void*)(uintptr_t)frame->sp, (void*)(uintptr_t)frame->x[18], frame->restore_flags);
 
-    /* Note: SIGALRM x18 watchdog was tried but is too disruptive (breaks
-     * PE code execution). The zero-page silent read issue remains — when
-     * x18=0, [x18+0x60] returns PEB=0 from the hardware zero page without
-     * faulting, so the Mach handler can't intervene. */
+    /* Note: SIGALRM x18 watchdog was tried but abandoned — too disruptive
+     * for PE code execution. The zero-page silent read issue remains:
+     * when x18=0, [x18+0x60] returns PEB=0 from the hardware zero page
+     * without faulting, so the Mach handler can't intervene. */
 #endif
 
     pthread_sigmask( SIG_UNBLOCK, &server_block_set, NULL );
@@ -2773,13 +2718,13 @@ __ASM_GLOBAL_FUNC( signal_start_thread,
 __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "hint 34\n\t" /* bti c */
 #ifdef WINE_IOS
-                   /* Capture x18 at dispatcher entry for debugging */
-                   "adrp x10, " __ASM_NAME("g_wine_dispatcher_x18") "@PAGE\n\t"
-                   "str x18, [x10, " __ASM_NAME("g_wine_dispatcher_x18") "@PAGEOFF]\n\t"
-                   "adrp x10, " __ASM_NAME("g_wine_dispatcher_count") "@PAGE\n\t"
-                   "ldr x11, [x10, " __ASM_NAME("g_wine_dispatcher_count") "@PAGEOFF]\n\t"
-                   "add x11, x11, #1\n\t"
-                   "str x11, [x10, " __ASM_NAME("g_wine_dispatcher_count") "@PAGEOFF]\n\t"
+                   /* iOS zeros x18 on context switches. Load TEB from TPIDRRO_EL0
+                    * (pthread TLS) which iOS preserves. Fix x18 for frame saves. */
+                   "mrs x10, TPIDRRO_EL0\n\t"
+                   "and x10, x10, #~7\n\t"       /* clear CPU number bits */
+                   "adrp x11, " __ASM_NAME("ios_teb_tls_slot_offset") "@PAGE\n\t"
+                   "ldr w11, [x11, " __ASM_NAME("ios_teb_tls_slot_offset") "@PAGEOFF]\n\t"
+                   "ldr x18, [x10, x11]\n\t"     /* x18 = TEB from TLS slot */
 #endif
                    "ldr x10, [x18, #0x378]\n\t" /* thread_data->syscall_frame */
                    "stp x18, x19, [x10, #0x90]\n\t"
@@ -2896,6 +2841,9 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "ldp x12, x13, [sp, #0x60]\n\t"
                    "ldp x14, x15, [sp, #0x70]\n"
                    "2:\tldp x18, x19, [sp, #0x90]\n\t"
+#ifdef WINE_IOS
+                   /* TPIDR_EL0 not used — iOS zeros it. TEB stored via pthread TLS (TPIDRRO_EL0). */
+#endif
                    "ldp x20, x21, [sp, #0xa0]\n\t"
                    "ldp x22, x23, [sp, #0xb0]\n\t"
                    "ldp x24, x25, [sp, #0xc0]\n\t"
@@ -2974,6 +2922,13 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
  */
 __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "hint 34\n\t" /* bti c */
+#ifdef WINE_IOS
+                   "mrs x10, TPIDRRO_EL0\n\t"
+                   "and x10, x10, #~7\n\t"
+                   "adrp x11, " __ASM_NAME("ios_teb_tls_slot_offset") "@PAGE\n\t"
+                   "ldr w11, [x11, " __ASM_NAME("ios_teb_tls_slot_offset") "@PAGEOFF]\n\t"
+                   "ldr x18, [x10, x11]\n\t"     /* x18 = TEB from TLS */
+#endif
                    "ldr x10, [x18, #0x378]\n\t" /* thread_data->syscall_frame */
                    "stp x18, x19, [x10, #0x90]\n\t"
                    "stp x20, x21, [x10, #0xa0]\n\t"
@@ -3013,6 +2968,9 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "cbnz w16, " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") "\n\t"
                    __ASM_CFI_CFA_IS_AT2(sp, 0x98, 0x02) /* frame->syscall_cfa */
                    "ldp x18, x19, [sp, #0x90]\n\t"
+#ifdef WINE_IOS
+                   "msr TPIDR_EL0, x18\n\t"  /* keep TPIDR_EL0 in sync */
+#endif
                    "ldp x16, x17, [sp, #0xf8]\n\t"
                    /* switch to user stack */
                    "mov sp, x16\n\t"
