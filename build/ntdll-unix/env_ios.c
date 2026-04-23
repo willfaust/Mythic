@@ -1592,8 +1592,33 @@ static WCHAR *build_command_line( WCHAR **wargv )
 static void run_wineboot( WCHAR *env, SIZE_T size )
 {
 #ifdef WINE_IOS
-    os_log(OS_LOG_DEFAULT, "[Wine] SKIP run_wineboot (iOS: no fork/exec)");
-    return;
+    // iOS: prefix is pre-seeded from bundled tarball (Proton-style). We skip
+    // launching wineboot.exe entirely, but we still have to do the two things
+    // it signals to the rest of ntdll:
+    //   1. Initialize KUSER_SHARED_DATA (GetTickCount, processor features...)
+    //   2. Create + signal \KernelObjects\__wineboot_event so any waiter
+    //      (including a second wine process reusing the prefix) proceeds.
+    {
+        static const WCHAR eventW[] = {'\\','K','e','r','n','e','l','O','b','j','e','c','t','s',
+            '\\','_','_','w','i','n','e','b','o','o','t','_','e','v','e','n','t',0};
+        HANDLE event;
+        UNICODE_STRING nameW;
+        OBJECT_ATTRIBUTES attr;
+        unsigned int status;
+
+        virtual_init_user_shared_data();
+        init_unicode_string( &nameW, eventW );
+        InitializeObjectAttributes( &attr, &nameW, OBJ_OPENIF, 0, NULL );
+        status = NtCreateEvent( &event, EVENT_ALL_ACCESS, &attr, NotificationEvent, 1 );
+        if (!status || status == STATUS_OBJECT_NAME_EXISTS) {
+            NtSetEvent( event, NULL );
+            NtClose( event );
+            os_log(OS_LOG_DEFAULT, "[Wine] run_wineboot: pre-signaled __wineboot_event (iOS pre-seeded prefix)");
+        } else {
+            os_log(OS_LOG_DEFAULT, "[Wine] run_wineboot: NtCreateEvent failed 0x%x", status);
+        }
+        return;
+    }
 #endif
     static const WCHAR eventW[] = {'\\','K','e','r','n','e','l','O','b','j','e','c','t','s',
         '\\','_','_','w','i','n','e','b','o','o','t','_','e','v','e','n','t',0};

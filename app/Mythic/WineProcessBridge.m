@@ -12,6 +12,7 @@
 
 #include "WineProcessBridge.h"
 #include "WineServerBridge.h"
+#include "PrefixExtractor.h"
 
 // Thread-local globals for wine_ios_exit longjmp (used by wine_ios_exit.h shim in ntdll)
 // Each Wine "process" thread has its own jmpbuf so child processes can exit independently.
@@ -42,6 +43,37 @@ static char *g_prefix_path = NULL;
 static void *wine_process_thread(void *arg) {
     @autoreleasepool {
         LOG("Wine process thread started");
+
+        // Seed prefix from bundled template on first launch (Proton-style).
+        // The presence of .update-timestamp means wineboot has already run
+        // (either for real or via our pre-seed), so the ntdll-side
+        // run_wineboot will skip the launch path.
+        {
+            NSString *prefix = [NSString stringWithUTF8String:g_prefix_path];
+            NSString *stamp = [prefix stringByAppendingPathComponent:@".update-timestamp"];
+            NSFileManager *fm = [NSFileManager defaultManager];
+            if (![fm fileExistsAtPath:stamp]) {
+                NSString *tgz = [[NSBundle mainBundle] pathForResource:@"prefix-template" ofType:@"tar.gz"];
+                if (!tgz) {
+                    LOG("prefix-template.tar.gz missing from bundle!");
+                } else {
+                    LOG("Seeding prefix from %{public}s", tgz.UTF8String);
+                    if (mythic_extract_prefix_tgz(tgz.UTF8String, g_prefix_path) != 0) {
+                        LOG("prefix extraction FAILED");
+                    } else {
+                        LOG("prefix seeded to %{public}s", g_prefix_path);
+                    }
+                }
+            }
+
+            // (Re)create dosdevices/c: -> ../drive_c. The tarball omits
+            // dosdevices because Mac's z: -> / is wrong here.
+            NSString *dosdev = [prefix stringByAppendingPathComponent:@"dosdevices"];
+            [fm createDirectoryAtPath:dosdev withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString *cLink = [dosdev stringByAppendingPathComponent:@"c:"];
+            [fm removeItemAtPath:cLink error:nil];
+            [fm createSymbolicLinkAtPath:cLink withDestinationPath:@"../drive_c" error:nil];
+        }
 
         // Set environment for Wine
         setenv("WINEPREFIX", g_prefix_path, 1);
@@ -104,10 +136,10 @@ static void *wine_process_thread(void *arg) {
             LOG("Symlinked %d DLLs from bundle to %{public}s", linked, sys32Dir.UTF8String);
         }
 
-        // Call Wine's main entry point
-        // argv[0] = "wine", argv[1] = program to run
-        char *argv[] = { "wine", "C:\\windows\\system32\\wineboot.exe", "--init", NULL };
-        int argc = 3;
+        // Call Wine's main entry point with cmd.exe (prefix is pre-seeded,
+        // so we skip wineboot.exe entirely — see run_wineboot in env_ios.c).
+        char *argv[] = { "wine", "C:\\windows\\system32\\cmd.exe", "/c", "echo mythic-pre-seed-OK && exit 0", NULL };
+        int argc = 4;
 
         // Record this thread so wine_ios_exit knows where to longjmp
         wine_ios_main_thread = pthread_self();

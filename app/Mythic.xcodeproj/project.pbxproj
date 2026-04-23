@@ -30,6 +30,9 @@
 		A1000033 /* wine_stubs.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000034; };
 		A1000034 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000035; };
 		A1000035 /* StikJITHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000036; };
+		A1000040 /* prefix-template.tar.gz in Resources */ = {isa = PBXBuildFile; fileRef = A2000040; };
+		A1000041 /* PrefixExtractor.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000041; };
+		A1000042 /* libz.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000042; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -64,6 +67,10 @@
 		A2000034 /* wine_stubs.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = wine_stubs.c; sourceTree = "<group>"; };
 		A2000035 /* IOKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOKit.framework; path = System/Library/Frameworks/IOKit.framework; sourceTree = SDKROOT; };
 		A2000036 /* StikJITHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StikJITHelper.swift; sourceTree = "<group>"; };
+		A2000040 /* prefix-template.tar.gz */ = {isa = PBXFileReference; lastKnownFileType = archive.gzip; path = "prefix-template.tar.gz"; sourceTree = "<group>"; };
+		A2000041 /* PrefixExtractor.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = PrefixExtractor.c; sourceTree = "<group>"; };
+		A2000043 /* PrefixExtractor.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = PrefixExtractor.h; sourceTree = "<group>"; };
+		A2000042 /* libz.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = "libz.tbd"; path = "usr/lib/libz.tbd"; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -82,6 +89,7 @@
 				A1000021 /* libwineserver.a in Frameworks */,
 				A1000031 /* libntdll_unix.a in Frameworks */,
 				A1000034 /* IOKit.framework in Frameworks */,
+				A1000042 /* libz.tbd in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -115,6 +123,9 @@
 				A2000036 /* StikJITHelper.swift */,
 				A2000021 /* nls */,
 				A2000033 /* aarch64-windows */,
+				A2000040 /* prefix-template.tar.gz */,
+				A2000041 /* PrefixExtractor.c */,
+				A2000043 /* PrefixExtractor.h */,
 				A2000034 /* wine_stubs.c */,
 				A2000006 /* Mythic-Bridging-Header.h */,
 				A2000007 /* Mythic.entitlements */,
@@ -145,6 +156,7 @@
 				A2000020 /* libwineserver.a */,
 				A2000032 /* libntdll_unix.a */,
 				A2000035 /* IOKit.framework */,
+				A2000042 /* libz.tbd */,
 			);
 			name = Libraries;
 			sourceTree = "<group>";
@@ -209,6 +221,7 @@
 			files = (
 				A1000022 /* nls in Resources */,
 				A1000032 /* aarch64-windows in Resources */,
+				A1000040 /* prefix-template.tar.gz in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -228,6 +241,7 @@
 				A1000020 /* WineServerBridge.m in Sources */,
 				A1000030 /* WineProcessBridge.m in Sources */,
 				A1000033 /* wine_stubs.c in Sources */,
+				A1000041 /* PrefixExtractor.c in Sources */,
 				A1000035 /* StikJITHelper.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
