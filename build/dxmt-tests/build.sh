@@ -22,11 +22,13 @@ WINEBUILD="$REPO_ROOT/wine/build-macos/tools/winebuild/winebuild"
 WINE=${WINE:-/opt/homebrew/bin/wine}
 
 CPP_SRC="$DXMT_TESTS/dx11_${TEST}.cpp"
-HLSL_SRC="$DXMT_TESTS/shader_${TEST}.hlsl"
-HLSL_NAME="shader_${TEST}.hlsl"
-
 if [[ ! -f "$CPP_SRC" ]]; then echo "no test source: $CPP_SRC"; exit 1; fi
-if [[ ! -f "$HLSL_SRC" ]]; then echo "no shader source: $HLSL_SRC"; exit 1; fi
+
+# Some upstream tests use a generic 'shaders.hlsl'; others use
+# shader_${TEST}.hlsl. Pick whichever the .cpp actually references.
+HLSL_NAME=$(grep -oE 'L"shader[a-z_]*\.hlsl"' "$CPP_SRC" | head -1 | tr -d 'L"')
+HLSL_SRC="$DXMT_TESTS/$HLSL_NAME"
+if [[ ! -f "$HLSL_SRC" ]]; then echo "no shader source: $HLSL_SRC (looked up via grep)"; exit 1; fi
 if [[ ! -x "$HLSL_COMPILE" ]]; then
     echo "building host-side HLSL compiler"
     "$REPO_ROOT/build/d3d11-triangle/build.sh" >/dev/null
