@@ -47,6 +47,9 @@ build/d3d11-triangle/ps_dxbc.h
 build/d3d11-triangle/hlsl_compile.exe
 build/d3d11-triangle/triangle.exe
 
+# DXMT test-suite per-test build output
+build/dxmt-tests/out/
+
 # Wineboot subprocesses — dormant while Phase 3+ uses a pre-seeded prefix
 # and skips wineboot. Rebuilt from the wine submodule if needed (requires
 # bison 3.x + llvm-dlltool).
