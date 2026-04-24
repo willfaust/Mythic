@@ -39,6 +39,15 @@ build/dxmt-ios/shader-headers/
 build/dxmt-ios/libdxmt_unix.a
 build/dxmt-ios/libdxmt_combined.a
 
+# Wineboot subprocesses — dormant while Phase 3+ uses a pre-seeded prefix
+# and skips wineboot. Rebuilt from the wine submodule if needed (requires
+# bison 3.x + llvm-dlltool).
+app/Mythic/aarch64-windows/services.exe
+app/Mythic/aarch64-windows/plugplay.exe
+app/Mythic/aarch64-windows/rpcss.exe
+app/Mythic/aarch64-windows/svchost.exe
+app/Mythic/aarch64-windows/winedevice.exe
+
 # Toolchains (pulled by build scripts)
 toolchains/
 
