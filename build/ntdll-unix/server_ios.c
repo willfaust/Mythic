@@ -156,7 +156,16 @@ BOOL process_exiting = FALSE;
 timeout_t server_start_time = 0;  /* time of server startup */
 
 sigset_t server_block_set;  /* signals to block during server calls */
-static _Thread_local int fd_socket = -1;  /* per-Wine-process socket to exchange fds with server */
+/* Wineserver socket for fd-passing. Must be shared across threads of the same
+ * Wine process — a POSIX fd is process-wide, and in-process CreateThread
+ * callers (e.g. DXMT's command-queue encode/finish threads) must reuse it.
+ *
+ * When CreateProcess child-process work is revived, each child-thread will
+ * need its own fd_socket; the stashed approach used _Thread_local here, but
+ * that silently broke in-process CreateThread because new threads got a -1
+ * value and sendmsg failed. Per-child fd_socket will need a different
+ * mechanism (e.g. keyed off a child-id set during thread setup). */
+static int fd_socket = -1;
 static _Thread_local int initial_cwd = -1;
 static pid_t server_pid;
 pthread_mutex_t fd_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
