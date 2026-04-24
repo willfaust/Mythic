@@ -2,7 +2,22 @@
 box64/
 LiveContainer/
 MeloNX/
-research/
+# research/ holds upstream clones for study, except research/dxmt which is
+# an active fork submodule — list siblings explicitly.
+research/angle/
+research/attesor/
+research/box64/
+research/dxvk/
+research/FEX/
+research/gamescope/
+research/LiveContainer/
+research/MoltenVK/
+research/ProjectChampollion/
+research/Proton/
+research/StikDebug/
+research/vkd3d-proton/
+research/Winlator-Ludashi/
+research/*.md
 
 # Build artifacts
 app/build/
@@ -16,6 +31,16 @@ build/wineserver/obj/
 app/Mythic/libntdll_unix.a
 app/Mythic/libwineserver.a
 app/libwineserver.a
+app/Mythic/libdxmt_combined.a
+
+# DXMT build artifacts
+build/dxmt-ios/obj/
+build/dxmt-ios/shader-headers/
+build/dxmt-ios/libdxmt_unix.a
+build/dxmt-ios/libdxmt_combined.a
+
+# Toolchains (pulled by build scripts)
+toolchains/
 
 # Xcode
 *.xcuserdata

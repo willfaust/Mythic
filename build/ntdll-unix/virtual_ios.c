@@ -1331,6 +1331,11 @@ static NTSTATUS get_unixlib_funcs( void *so_handle, BOOL wow, const void **funcs
 static NTSTATUS ios_stub_unix_call(void *args) {
     return STATUS_NOT_SUPPORTED;
 }
+
+/* DXMT's unix call table, statically linked into Mythic.app via
+ * libdxmt_combined.a (originally __wine_unix_call_funcs, renamed in
+ * winemetal_unix.c to avoid collision with our own ntdll table). */
+extern const void *dxmt_winemetal_unix_call_funcs[];
 #endif
 static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs )
 {
@@ -1354,13 +1359,40 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
     if (!status && entry) status = entry();
 #ifdef WINE_IOS
     /* On iOS, unix .so files aren't available for most DLLs.
-     * Return success so DllMain doesn't abort. The PE DLL will work
-     * but unix calls will fail at runtime (STATUS_NOT_SUPPORTED). */
+     * Detect the special case where the unix_path names a DLL whose unix
+     * side is statically linked into Mythic.app, and point funcs at that
+     * table instead of the dummy stub. */
     if (status == STATUS_DLL_NOT_FOUND)
     {
-        *funcs = (const void *)ios_stub_unix_call;
-        WARN_(module)("iOS: no unix .so for module %p, using stub\n", module);
-        status = STATUS_SUCCESS;
+        /* unix_path may not be set on iOS (our loader doesn't always call
+         * set_builtin_unixlib_name), so fall back to reading the DLL name
+         * from the PE export directory. */
+        const char *modname = NULL;
+        const IMAGE_DOS_HEADER *dos = module;
+        if (dos && dos->e_magic == IMAGE_DOS_SIGNATURE) {
+            const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)((char *)module + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                DWORD exp_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+                if (exp_rva) {
+                    const IMAGE_EXPORT_DIRECTORY *exp = (const IMAGE_EXPORT_DIRECTORY *)((char *)module + exp_rva);
+                    if (exp->Name) modname = (const char *)module + exp->Name;
+                }
+            }
+        }
+        const char *up = NULL;
+        if ((builtin = get_builtin_module( module ))) up = builtin->unix_path;
+        const char *match = up ? up : modname;
+        if (match && strstr(match, "winemetal")) {
+            *funcs = (const void *)dxmt_winemetal_unix_call_funcs;
+            WARN_(module)("iOS: module %p (%s) -> dxmt_winemetal_unix_call_funcs (%p)\n",
+                          module, match, dxmt_winemetal_unix_call_funcs);
+            status = STATUS_SUCCESS;
+        } else {
+            *funcs = (const void *)ios_stub_unix_call;
+            WARN_(module)("iOS: no unix .so for module %p (unix_path=%s, modname=%s), using stub\n",
+                          module, up ? up : "(null)", modname ? modname : "(null)");
+            status = STATUS_SUCCESS;
+        }
     }
 #endif
     return status;
@@ -4103,6 +4135,26 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
 #endif
     status = STATUS_SUCCESS;
 
+#ifdef WINE_IOS
+    /* Eagerly JIT-copy all EXEC sections right here — every PE load goes
+     * through map_image_into_view, regardless of whether it's via
+     * virtual_map_image (builtin flag) or any alternate path. */
+    ERR("iOS map_image_into_view: view=%p EXEC fixup\n", ptr);
+    for (int si = 0; si < nt->FileHeader.NumberOfSections; si++)
+    {
+        if (!(sec[si].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        SIZE_T sec_size = sec[si].Misc.VirtualSize
+            ? ROUND_SIZE(sec[si].VirtualAddress, sec[si].Misc.VirtualSize, align_mask)
+            : ROUND_SIZE(sec[si].VirtualAddress, sec[si].SizeOfRawData, align_mask);
+        void *sec_addr = ptr + sec[si].VirtualAddress;
+        int prot = PROT_READ | PROT_EXEC;
+        if (sec[si].Characteristics & IMAGE_SCN_MEM_WRITE) prot |= PROT_WRITE;
+        ERR("iOS: eager JIT-copy section %.8s (addr=%p size=0x%lx)\n",
+            sec[si].Name, sec_addr, (unsigned long)sec_size);
+        mprotect_exec(sec_addr, sec_size, prot);
+    }
+#endif
+
 done:
     free( sections );
     return status;
@@ -4291,7 +4343,47 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
     }
     if (NT_SUCCESS(status))
     {
+#ifdef WINE_IOS
+        ERR("iOS virtual_map_image: view=%p is_builtin=%d offset=%ld\n",
+            view->base, is_builtin, (long)offset);
+#endif
         if (is_builtin && !offset) add_builtin_module( view->base, NULL );
+#ifdef WINE_IOS
+        /* For builtin images on iOS: eagerly trigger the JIT copy for each
+         * EXEC section. Normally Wine relies on an mprotect(PROT_EXEC) call
+         * from somewhere downstream to activate section execution, but for
+         * our main .exe that path isn't hit (sections are mapped via
+         * PROT_READ|PROT_WRITECOPY and no subsequent protect flips them to
+         * EXEC). Without the JIT copy, triangle.exe's .text isn't executable
+         * and we bus-fault on its first instruction.
+         */
+        if (is_builtin && !offset)
+        {
+            IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)view->base;
+            if (dos && dos->e_magic == IMAGE_DOS_SIGNATURE)
+            {
+                IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((char *)view->base + dos->e_lfanew);
+                if (nt->Signature == IMAGE_NT_SIGNATURE)
+                {
+                    IMAGE_SECTION_HEADER *s = IMAGE_FIRST_SECTION(nt);
+                    SIZE_T align_mask = max(image_info->alignment - 1, page_mask);
+                    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++)
+                    {
+                        if (!(s[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+                        SIZE_T sec_size = s[i].Misc.VirtualSize
+                            ? ROUND_SIZE(s[i].VirtualAddress, s[i].Misc.VirtualSize, align_mask)
+                            : ROUND_SIZE(s[i].VirtualAddress, s[i].SizeOfRawData, align_mask);
+                        void *sec_addr = (char *)view->base + s[i].VirtualAddress;
+                        int prot = PROT_READ | PROT_EXEC;
+                        if (s[i].Characteristics & IMAGE_SCN_MEM_WRITE) prot |= PROT_WRITE;
+                        ERR("iOS: eager JIT-copy for builtin %s section (base=%p size=0x%lx)\n",
+                            s[i].Name, sec_addr, (unsigned long)sec_size);
+                        mprotect_exec(sec_addr, sec_size, prot);
+                    }
+                }
+            }
+        }
+#endif
         *addr_ptr = view->base;
         *size_ptr = size;
         VIRTUAL_DEBUG_DUMP_VIEW( view );

@@ -5,3 +5,7 @@
 [submodule "wine"]
 	path = wine
 	url = https://github.com/willfaust/wine.git
+[submodule "research/dxmt"]
+	path = research/dxmt
+	url = https://github.com/willfaust/dxmt.git
+	branch = ios-port

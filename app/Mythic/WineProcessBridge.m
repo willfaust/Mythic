@@ -136,10 +136,10 @@ static void *wine_process_thread(void *arg) {
             LOG("Symlinked %d DLLs from bundle to %{public}s", linked, sys32Dir.UTF8String);
         }
 
-        // Call Wine's main entry point with cmd.exe (prefix is pre-seeded,
-        // so we skip wineboot.exe entirely — see run_wineboot in env_ios.c).
-        char *argv[] = { "wine", "C:\\windows\\system32\\cmd.exe", "/c", "echo mythic-pre-seed-OK && exit 0", NULL };
-        int argc = 4;
+        // Phase 3B: run the D3D11 triangle test so DXMT's PE/unix graphics
+        // path gets exercised (swapchain → HWND → CAMetalLayer → present).
+        char *argv[] = { "wine", "C:\\windows\\system32\\triangle.exe", NULL };
+        int argc = 2;
 
         // Record this thread so wine_ios_exit knows where to longjmp
         wine_ios_main_thread = pthread_self();

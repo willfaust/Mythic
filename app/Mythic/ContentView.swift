@@ -1,5 +1,44 @@
 import SwiftUI
+import UIKit
+import QuartzCore
+import Metal
 import os.log
+
+// UIView whose backing layer is a CAMetalLayer (what DXMT renders into).
+final class MetalBackedView: UIView {
+    override class var layerClass: AnyClass { return CAMetalLayer.self }
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        if let layer = self.layer as? CAMetalLayer {
+            let scale = self.contentScaleFactor
+            let w = max(1, bounds.width * scale)
+            let h = max(1, bounds.height * scale)
+            layer.drawableSize = CGSize(width: w, height: h)
+        }
+    }
+}
+
+// SwiftUI wrapper that publishes its CAMetalLayer to the DXMT shim.
+struct MythicMetalView: UIViewRepresentable {
+    func makeUIView(context: Context) -> MetalBackedView {
+        let v = MetalBackedView(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
+        v.backgroundColor = .black
+        v.contentScaleFactor = UIScreen.main.scale
+        if let layer = v.layer as? CAMetalLayer {
+            layer.device = MTLCreateSystemDefaultDevice()
+            layer.pixelFormat = .bgra8Unorm
+            layer.framebufferOnly = true
+            // Explicit drawableSize — otherwise CAMetalLayer.nextDrawable
+            // blocks until bounds are non-zero, and DXMT's swapchain setup
+            // deadlocks before SwiftUI gets a chance to lay the view out.
+            layer.drawableSize = CGSize(width: 800, height: 600)
+            mythic_display_set_layer(layer)
+            LogStore.shared.log("MetalLayer registered with DXMT shim", level: .success)
+        }
+        return v
+    }
+    func updateUIView(_ uiView: MetalBackedView, context: Context) {}
+}
 
 struct ContentView: View {
     @StateObject private var logStore = LogStore.shared
@@ -25,6 +64,13 @@ struct ContentView: View {
                 if let ents = entitlements {
                     entitlementBadges(ents)
                 }
+
+                Divider()
+
+                // Metal render surface for DXMT output.
+                MythicMetalView()
+                    .frame(height: 240)
+                    .background(Color.black)
 
                 Divider()
 
@@ -164,6 +210,12 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
                 .tint(.orange)
 
+                Button("Run D3D11 Triangle") {
+                    runTriangleTest()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.blue)
+
                 Button("Clear Log") {
                     logStore.clear()
                 }
@@ -172,6 +224,15 @@ struct ContentView: View {
             }
             .padding()
         }
+    }
+
+    private func runTriangleTest() {
+        logStore.log("D3D11 triangle test: full sequence", level: .info)
+        // Reuse the existing full Wine sequence but target triangle.exe.
+        // WineProcessBridge has the program baked in for now — to flip it
+        // requires a signature change. For this iteration we rely on the
+        // build's WineProcessBridge.m pointing at triangle.exe.
+        runWineFullSequence()
     }
 
     private var logConsole: some View {

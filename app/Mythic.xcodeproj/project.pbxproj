@@ -33,6 +33,12 @@
 		A1000040 /* prefix-template.tar.gz in Resources */ = {isa = PBXBuildFile; fileRef = A2000040; };
 		A1000041 /* PrefixExtractor.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000041; };
 		A1000042 /* libz.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000042; };
+		A1000050 /* IOSDisplayShim.m in Sources */ = {isa = PBXBuildFile; fileRef = A2000050; };
+		A1000051 /* libdxmt_combined.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000051; };
+		A1000052 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000052; };
+		A1000053 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000053; };
+		A1000054 /* MetalFX.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000054; };
+		A1000055 /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000055; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -71,6 +77,13 @@
 		A2000041 /* PrefixExtractor.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = PrefixExtractor.c; sourceTree = "<group>"; };
 		A2000043 /* PrefixExtractor.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = PrefixExtractor.h; sourceTree = "<group>"; };
 		A2000042 /* libz.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = "libz.tbd"; path = "usr/lib/libz.tbd"; sourceTree = SDKROOT; };
+		A2000050 /* IOSDisplayShim.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = IOSDisplayShim.m; sourceTree = "<group>"; };
+		A2000056 /* IOSDisplayShim.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = IOSDisplayShim.h; sourceTree = "<group>"; };
+		A2000051 /* libdxmt_combined.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libdxmt_combined.a; sourceTree = "<group>"; };
+		A2000052 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		A2000053 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+		A2000054 /* MetalFX.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalFX.framework; path = System/Library/Frameworks/MetalFX.framework; sourceTree = SDKROOT; };
+		A2000055 /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = "libsqlite3.tbd"; path = "usr/lib/libsqlite3.tbd"; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -90,6 +103,11 @@
 				A1000031 /* libntdll_unix.a in Frameworks */,
 				A1000034 /* IOKit.framework in Frameworks */,
 				A1000042 /* libz.tbd in Frameworks */,
+				A1000051 /* libdxmt_combined.a in Frameworks */,
+				A1000052 /* Metal.framework in Frameworks */,
+				A1000053 /* QuartzCore.framework in Frameworks */,
+				A1000054 /* MetalFX.framework in Frameworks */,
+				A1000055 /* libsqlite3.tbd in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -126,6 +144,8 @@
 				A2000040 /* prefix-template.tar.gz */,
 				A2000041 /* PrefixExtractor.c */,
 				A2000043 /* PrefixExtractor.h */,
+				A2000050 /* IOSDisplayShim.m */,
+				A2000056 /* IOSDisplayShim.h */,
 				A2000034 /* wine_stubs.c */,
 				A2000006 /* Mythic-Bridging-Header.h */,
 				A2000007 /* Mythic.entitlements */,
@@ -157,6 +177,11 @@
 				A2000032 /* libntdll_unix.a */,
 				A2000035 /* IOKit.framework */,
 				A2000042 /* libz.tbd */,
+				A2000051 /* libdxmt_combined.a */,
+				A2000052 /* Metal.framework */,
+				A2000053 /* QuartzCore.framework */,
+				A2000054 /* MetalFX.framework */,
+				A2000055 /* libsqlite3.tbd */,
 			);
 			name = Libraries;
 			sourceTree = "<group>";
@@ -242,6 +267,7 @@
 				A1000030 /* WineProcessBridge.m in Sources */,
 				A1000033 /* wine_stubs.c in Sources */,
 				A1000041 /* PrefixExtractor.c in Sources */,
+				A1000050 /* IOSDisplayShim.m in Sources */,
 				A1000035 /* StikJITHelper.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
