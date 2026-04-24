@@ -1,6 +1,7 @@
-// triangle.c — minimal D3D11 test: create device + swapchain, clear to
-// magenta, draw a triangle, sleep, exit. No HLSL compiler; pre-baked
-// DXBC for the shaders (generated at build time via fxc or dxc).
+// triangle.c — clear screen + draw one RGB-gradient triangle via D3D11.
+// Shaders are pre-compiled to DXBC at build time (host-side via Wine's
+// vkd3d-shader) and embedded as C arrays — no runtime shader compiler
+// needed inside the PE, which keeps the Wine dep chain minimal.
 //
 // Cross-compiled as aarch64-windows PE for use inside Mythic's Wine.
 
@@ -9,6 +10,9 @@
 #include <dxgi.h>
 #include <stdio.h>
 
+#include "vs_dxbc.h"
+#include "ps_dxbc.h"
+
 static const char g_class_name[] = "MythicTriangleWnd";
 
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -16,8 +20,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
+struct Vertex { float x, y, z; float r, g, b; };
+
 int main(int argc, char **argv) {
-    fprintf(stderr, "[triangle] starting\n");
+    fprintf(stderr, "[triangle] starting (vs=%u ps=%u bytes)\n",
+            (unsigned)vs_dxbc_len, (unsigned)ps_dxbc_len);
 
     WNDCLASSA wc = {0};
     wc.lpfnWndProc = wndproc;
@@ -46,40 +53,64 @@ int main(int argc, char **argv) {
     ID3D11DeviceContext *ctx = NULL;
     IDXGISwapChain *swap = NULL;
     D3D_FEATURE_LEVEL fl_out;
-
     D3D_FEATURE_LEVEL fls[] = { D3D_FEATURE_LEVEL_11_0 };
     HRESULT hr = D3D11CreateDeviceAndSwapChain(
         NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
         fls, 1, D3D11_SDK_VERSION,
         &scd, &swap, &device, &fl_out, &ctx);
-
-    if (FAILED(hr)) {
-        fprintf(stderr, "[triangle] D3D11CreateDeviceAndSwapChain failed 0x%lx\n", hr);
-        return 1;
-    }
+    if (FAILED(hr)) { fprintf(stderr, "[triangle] CreateDevice+Swap failed 0x%lx\n", hr); return 1; }
     fprintf(stderr, "[triangle] device created, feature_level=0x%x\n", fl_out);
 
     ID3D11Texture2D *backbuf = NULL;
-    hr = swap->lpVtbl->GetBuffer(swap, 0, &IID_ID3D11Texture2D, (void **)&backbuf);
-    if (FAILED(hr)) { fprintf(stderr, "[triangle] GetBuffer failed\n"); return 2; }
-
+    swap->lpVtbl->GetBuffer(swap, 0, &IID_ID3D11Texture2D, (void **)&backbuf);
     ID3D11RenderTargetView *rtv = NULL;
-    hr = device->lpVtbl->CreateRenderTargetView(device, (ID3D11Resource *)backbuf, NULL, &rtv);
-    if (FAILED(hr)) { fprintf(stderr, "[triangle] CreateRTV failed\n"); return 3; }
+    device->lpVtbl->CreateRenderTargetView(device, (ID3D11Resource *)backbuf, NULL, &rtv);
 
-    float clear[] = {1.0f, 0.0f, 1.0f, 1.0f}; // magenta
-    ctx->lpVtbl->ClearRenderTargetView(ctx, rtv, clear);
-    fprintf(stderr, "[triangle] cleared to magenta\n");
+    // Create shaders from pre-compiled DXBC blobs.
+    ID3D11VertexShader *vs = NULL;
+    ID3D11PixelShader  *ps = NULL;
+    device->lpVtbl->CreateVertexShader(device, vs_dxbc, vs_dxbc_len, NULL, &vs);
+    device->lpVtbl->CreatePixelShader (device, ps_dxbc, ps_dxbc_len, NULL, &ps);
+    fprintf(stderr, "[triangle] shaders created vs=%p ps=%p\n", (void*)vs, (void*)ps);
 
-    // Present — this is where DXMT hands pixels to our CAMetalLayer.
-    hr = swap->lpVtbl->Present(swap, 1, 0);
-    fprintf(stderr, "[triangle] Present returned 0x%lx\n", hr);
+    // Input layout matches the VS signature (POSITION + COLOR).
+    D3D11_INPUT_ELEMENT_DESC il[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,  0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "COLOR",    0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+    };
+    ID3D11InputLayout *layout = NULL;
+    device->lpVtbl->CreateInputLayout(device, il, 2, vs_dxbc, vs_dxbc_len, &layout);
 
-    // Let a few frames render so we can see the output.
-    for (int i = 0; i < 60; i++) {
+    // Classic "RGB at each vertex" triangle in NDC.
+    struct Vertex tri[] = {
+        {  0.0f,  0.6f, 0.0f,  1.0f, 0.0f, 0.0f },
+        {  0.6f, -0.6f, 0.0f,  0.0f, 1.0f, 0.0f },
+        { -0.6f, -0.6f, 0.0f,  0.0f, 0.0f, 1.0f },
+    };
+    D3D11_BUFFER_DESC vb_desc = {
+        .ByteWidth = sizeof(tri), .Usage = D3D11_USAGE_IMMUTABLE,
+        .BindFlags = D3D11_BIND_VERTEX_BUFFER,
+    };
+    D3D11_SUBRESOURCE_DATA vb_init = { .pSysMem = tri };
+    ID3D11Buffer *vb = NULL;
+    device->lpVtbl->CreateBuffer(device, &vb_desc, &vb_init, &vb);
+
+    D3D11_VIEWPORT vp = { 0, 0, 800.0f, 600.0f, 0.0f, 1.0f };
+    const float clear[] = { 0.1f, 0.15f, 0.2f, 1.0f };  // dark slate background
+    UINT stride = sizeof(struct Vertex), offset = 0;
+
+    fprintf(stderr, "[triangle] entering render loop\n");
+    for (int f = 0; f < 180; f++) {
         ctx->lpVtbl->ClearRenderTargetView(ctx, rtv, clear);
+        ctx->lpVtbl->OMSetRenderTargets(ctx, 1, &rtv, NULL);
+        ctx->lpVtbl->RSSetViewports(ctx, 1, &vp);
+        ctx->lpVtbl->IASetInputLayout(ctx, layout);
+        ctx->lpVtbl->IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx->lpVtbl->IASetVertexBuffers(ctx, 0, 1, &vb, &stride, &offset);
+        ctx->lpVtbl->VSSetShader(ctx, vs, NULL, 0);
+        ctx->lpVtbl->PSSetShader(ctx, ps, NULL, 0);
+        ctx->lpVtbl->Draw(ctx, 3, 0);
         swap->lpVtbl->Present(swap, 1, 0);
-        Sleep(16);
     }
 
     fprintf(stderr, "[triangle] exiting cleanly\n");

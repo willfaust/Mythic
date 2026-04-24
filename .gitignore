@@ -39,6 +39,14 @@ build/dxmt-ios/shader-headers/
 build/dxmt-ios/libdxmt_unix.a
 build/dxmt-ios/libdxmt_combined.a
 
+# D3D11 triangle test — compiled DXBC shaders + host-side HLSL compiler
+build/d3d11-triangle/vs.dxbc
+build/d3d11-triangle/ps.dxbc
+build/d3d11-triangle/vs_dxbc.h
+build/d3d11-triangle/ps_dxbc.h
+build/d3d11-triangle/hlsl_compile.exe
+build/d3d11-triangle/triangle.exe
+
 # Wineboot subprocesses — dormant while Phase 3+ uses a pre-seeded prefix
 # and skips wineboot. Rebuilt from the wine submodule if needed (requires
 # bison 3.x + llvm-dlltool).
