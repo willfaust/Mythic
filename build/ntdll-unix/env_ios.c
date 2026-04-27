@@ -376,6 +376,14 @@ DWORD ntdll_umbstowcs( const char *src, DWORD srclen, WCHAR *dst, DWORD dstlen )
 {
     unsigned int reslen;
 
+#ifdef WINE_IOS
+    /* iOS: some early init paths in win32u call this with NULL src/dst
+     * and nonzero len, which would crash utf8_mbstowcs. Treat as no-op
+     * rather than fault. (Discovered while bringing up win32u — see
+     * project_win32u_bringup.md in memory.) */
+    if ((!dst && dstlen) || (!src && srclen)) return 0;
+#endif
+
     if (unix_cp.CodePage != CP_UTF8) return cp_mbstowcs( &unix_cp, dst, dstlen, src, srclen );
 
     utf8_mbstowcs( dst, dstlen, &reslen, src, srclen );

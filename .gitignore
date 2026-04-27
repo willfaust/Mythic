@@ -32,6 +32,10 @@ app/Mythic/libntdll_unix.a
 app/Mythic/libwineserver.a
 app/libwineserver.a
 app/Mythic/libdxmt_combined.a
+app/Mythic/libwin32u_unix.a
+
+# win32u-unix build artifacts
+build/win32u-unix/obj/
 
 # DXMT build artifacts
 build/dxmt-ios/obj/

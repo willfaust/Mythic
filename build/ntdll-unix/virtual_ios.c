@@ -1336,6 +1336,14 @@ static NTSTATUS ios_stub_unix_call(void *args) {
  * libdxmt_combined.a (originally __wine_unix_call_funcs, renamed in
  * winemetal_unix.c to avoid collision with our own ntdll table). */
 extern const void *dxmt_winemetal_unix_call_funcs[];
+
+/* win32u's unix init, statically linked via libwin32u_unix.a. Renamed
+ * from __wine_unix_lib_init in build/win32u-unix/build.sh so future
+ * statically-linked unix libs can keep their own init without colliding.
+ * win32u doesn't use the unix_call_funcs dispatch — its PE side uses
+ * __wine_syscall_dispatcher and slot 1 of KeServiceDescriptorTable,
+ * which win32u_unix_lib_init() populates via KeAddSystemServiceTable. */
+extern NTSTATUS win32u_unix_lib_init(void);
 #endif
 static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs )
 {
@@ -1386,6 +1394,22 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             *funcs = (const void *)dxmt_winemetal_unix_call_funcs;
             WARN_(module)("iOS: module %p (%s) -> dxmt_winemetal_unix_call_funcs (%p)\n",
                           module, match, dxmt_winemetal_unix_call_funcs);
+            status = STATUS_SUCCESS;
+        } else if (match && strstr(match, "win32u")) {
+            /* Register win32u's NtUser / NtGdi syscall table in slot 1.
+             * Activating this causes user32 process_attach to crash until
+             * wineserver shared-memory bringup is complete; gated on the
+             * MYTHIC_WIN32U env var so we can flip it on for debugging. */
+            if (getenv("MYTHIC_WIN32U")) {
+                NTSTATUS s = win32u_unix_lib_init();
+                *funcs = (const void *)ios_stub_unix_call;
+                WARN_(module)("iOS: module %p (%s) -> win32u_unix_lib_init() = 0x%x (ACTIVE)\n",
+                              module, match, s);
+            } else {
+                *funcs = (const void *)ios_stub_unix_call;
+                WARN_(module)("iOS: module %p (%s) -> win32u unix lib linked but dormant\n",
+                              module, match);
+            }
             status = STATUS_SUCCESS;
         } else {
             *funcs = (const void *)ios_stub_unix_call;

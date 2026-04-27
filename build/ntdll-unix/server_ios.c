@@ -409,12 +409,6 @@ unsigned int CDECL wine_server_call( void *req_ptr )
  */
 NTSTATUS unixcall_wine_server_call( void *args )
 {
-#ifdef WINE_IOS
-    static int call_count = 0;
-    call_count++;
-    if (call_count <= 5 || (call_count % 100) == 0)
-        ERR("unixcall_wine_server_call: count=%d (via unix_call_dispatcher)\n", call_count);
-#endif
     return wine_server_call( args );
 }
 

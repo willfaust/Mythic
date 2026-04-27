@@ -90,7 +90,14 @@ static void *wine_process_thread(void *arg) {
         }
 
         // Debug output
-        setenv("WINEDEBUG", "err+all,fixme+all,warn+module,trace+process,trace+module,trace+loaddll", 1);
+        setenv("WINEDEBUG", "err+all,fixme+all,warn+module,trace+process,trace+module,trace+loaddll,trace+win,trace+user32,trace+syscall", 1);
+
+        // Phase 3D investigation: re-enabled. Investigation C concluded
+        // wineserver dispatch is fine; the `ws_log drops at high rate`
+        // artifact was the prior false signal. Now chasing a real bug:
+        // get_desktop_window's returned HWND fails get_user_object lookup
+        // when create_window receives it as req->parent.
+        setenv("MYTHIC_WIN32U", "1", 1);
 
         LOG("WINEPREFIX=%{public}s", g_prefix_path);
 
