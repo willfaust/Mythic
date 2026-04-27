@@ -2782,7 +2782,23 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 }
 
                 /* Patch x18 references in .text → TPIDR_EL0 trampolines.
-                 * Allocate trampoline space right after the PE image in the JIT pool. */
+                 * Allocate trampoline space right after the PE image in the JIT pool.
+                 *
+                 * SKIP x18 patching for x86_64 PEs (e.g. ARM64EC guest binaries).
+                 * The x86_64 instruction `push rbp; sub rsp, ...` (bytes 55 48 83 ec)
+                 * encodes as 0xec834855 little-endian, which our ARM64 instruction
+                 * decoder mistakenly recognizes as an x18-using load — corrupting
+                 * the function prologue. Only ARM64 (machine=0xaa64) needs patching. */
+                {
+                    char *rw_image = (char *)jit_rw_base + offset;
+                    USHORT pe_machine = *(USHORT *)(rw_image + pe_off + 4);
+                    if (pe_machine != IMAGE_FILE_MACHINE_ARM64)
+                    {
+                        ERR("iOS JIT: skipping x18 patcher for non-ARM64 PE (Machine=0x%x)\n",
+                            pe_machine);
+                        goto x18_patch_done;
+                    }
+                }
                 {
                     /* Find .text section info from mapping table */
                     int map_idx;
@@ -2826,6 +2842,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                         }
                     }
                 }
+                x18_patch_done: ;
             }
 
             /* Leave original code section as read-only */

@@ -217,10 +217,18 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
 
                 Button("Run Wine") {
+                    setenv("MYTHIC_EXE", "cube.exe", 1)
                     runWineFullSequence()
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.orange)
+
+                Button("Run x64 Hello (FEX/ARM64EC)") {
+                    setenv("MYTHIC_EXE", "hello-x64.exe", 1)
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
 
                 Button("Test JIT") {
                     runJITTest()

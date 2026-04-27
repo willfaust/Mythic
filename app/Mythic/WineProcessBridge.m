@@ -120,10 +120,22 @@ static void *wine_process_thread(void *arg) {
             }
         }
 
+        // Pick which exe to run (env var override, default = cube.exe).
+        // Set MYTHIC_EXE=hello-x64.exe in env to launch the ARM64EC test path.
+        const char *mythic_exe = getenv("MYTHIC_EXE");
+        if (!mythic_exe || !*mythic_exe) mythic_exe = "cube.exe";
+        // Heuristic: filenames containing "x64" use the arm64ec-windows bundle
+        // (which has the ARM64EC hybrid system DLLs that interop with x86_64
+        // guest code). Everything else uses the existing aarch64-windows bundle.
+        BOOL use_arm64ec = (strstr(mythic_exe, "x64") != NULL);
+        const char *bundle_subdir = use_arm64ec ? "arm64ec-windows" : "aarch64-windows";
+        LOG("Target exe: %{public}s (bundle=%{public}s)", mythic_exe, bundle_subdir);
+        dprintf(STDERR_FILENO, "[WineProc] Target exe: %s (bundle=%s)\n", mythic_exe, bundle_subdir);
+
         // Ensure Wine prefix has system32 directory with DLLs from bundle
         {
             NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
-            NSString *dllSource = [bundlePath stringByAppendingPathComponent:@"aarch64-windows"];
+            NSString *dllSource = [bundlePath stringByAppendingPathComponent:[NSString stringWithUTF8String:bundle_subdir]];
             NSString *prefix = [NSString stringWithUTF8String:g_prefix_path];
             NSString *sys32Dir = [prefix stringByAppendingPathComponent:@"drive_c/windows/system32"];
             NSFileManager *fm = [NSFileManager defaultManager];
@@ -140,13 +152,16 @@ static void *wine_process_thread(void *arg) {
                 if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil])
                     linked++;
             }
-            LOG("Symlinked %d DLLs from bundle to %{public}s", linked, sys32Dir.UTF8String);
+            LOG("Symlinked %d DLLs from %{public}s to %{public}s", linked, bundle_subdir, sys32Dir.UTF8String);
+            dprintf(STDERR_FILENO, "[WineProc] Symlinked %d DLLs from %s -> sys32\n", linked, bundle_subdir);
         }
 
-        // Phase 3B: run the D3D11 triangle test so DXMT's PE/unix graphics
-        // path gets exercised (swapchain → HWND → CAMetalLayer → present).
-        char *argv[] = { "wine", "C:\\windows\\system32\\cube.exe", NULL };
+        // Build the C:\windows\system32\<exe> path for Wine's PE loader.
+        char exe_path[256];
+        snprintf(exe_path, sizeof(exe_path), "C:\\windows\\system32\\%s", mythic_exe);
+        char *argv[] = { "wine", exe_path, NULL };
         int argc = 2;
+        dprintf(STDERR_FILENO, "[WineProc] argv[1] = %s\n", exe_path);
 
         // Record this thread so wine_ios_exit knows where to longjmp
         wine_ios_main_thread = pthread_self();
