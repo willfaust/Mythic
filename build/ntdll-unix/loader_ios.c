@@ -288,14 +288,34 @@ static const char *get_so_dir( WORD machine )
     }
 }
 
+/* iOS host runs ARM64 natively. When loading an x86_64 (AMD64) main image
+ * on ARM64, we want to find the ARM64EC hybrid PEs in `arm64ec-windows/`
+ * (which include both x64 thunks for the guest game and native ARM64 code
+ * for our system DLLs). Plain `aarch64-windows/` is for ARM64-only PEs.
+ * Mirrors Wine's is_arm64ec() in dlls/ntdll/unix/unix_private.h:95. */
+static BOOL is_arm64ec_mode(void)
+{
+    return (current_machine == IMAGE_FILE_MACHINE_ARM64 &&
+            main_image_info.Machine == IMAGE_FILE_MACHINE_AMD64);
+}
+
 static const char *get_pe_dir( WORD machine )
 {
     switch(machine)
     {
     case IMAGE_FILE_MACHINE_I386:  return "/i386-windows";
-    case IMAGE_FILE_MACHINE_AMD64: return "/x86_64-windows";
+    case IMAGE_FILE_MACHINE_AMD64:
+        /* In ARM64EC mode, route AMD64 lookups to the hybrid PE bundle. */
+        if (is_arm64ec_mode()) return "/arm64ec-windows";
+        return "/x86_64-windows";
     case IMAGE_FILE_MACHINE_ARMNT: return "/arm-windows";
-    case IMAGE_FILE_MACHINE_ARM64: return "/aarch64-windows";
+    case IMAGE_FILE_MACHINE_ARM64:
+        /* In ARM64EC mode, system DLLs live in arm64ec-windows/ as hybrid
+         * PEs (Machine=AMD64 with native ARM64 code via CHPEMetadata).
+         * The PE loader's machine match for ARM64 callers will resolve
+         * through the IMAGE_ARM64EC_METADATA dispatch table. */
+        if (is_arm64ec_mode()) return "/arm64ec-windows";
+        return "/aarch64-windows";
     default: return "";
     }
 }
