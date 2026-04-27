@@ -93,6 +93,10 @@ for src in $WINE_SRC/dlls/win32u/*.c $WINE_SRC/dlls/win32u/dibdrv/*.c; do
             compile_one "$BUILD_DIR/driver_ios.c" "driver"
             continue
             ;;
+        message)
+            compile_one "$BUILD_DIR/message_ios.c" "message"
+            continue
+            ;;
     esac
 
     compile_one "$src" "$name"

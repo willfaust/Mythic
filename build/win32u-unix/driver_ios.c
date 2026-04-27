@@ -40,6 +40,58 @@ static const struct user_driver_funcs lazy_load_driver;
 static struct user_driver_funcs null_user_driver;
 static WCHAR driver_load_error[80];
 
+#ifdef WINE_IOS
+/* winios.drv — Mythic's iOS display/input driver. Lives in
+ * app/Mythic/Winios/. Most slots stay NULL so __wine_set_user_driver's
+ * SET_USER_FUNC fallback installs the always-success nulldrv_* stubs;
+ * we only override the bits that need real iOS UIKit bridging
+ * (pProcessEvents, pSetCursor, etc.) once those are wired up.
+ *
+ * Implementations live in app/Mythic/Winios/Winios.m and are pulled in
+ * via these extern declarations. Each is __attribute__((weak)) so the
+ * driver registers cleanly even before the Obj-C side is implemented —
+ * a missing impl resolves to NULL and SET_USER_FUNC falls back. */
+extern BOOL winios_pCreateWindow( HWND hwnd ) __attribute__((weak));
+extern BOOL winios_pProcessEvents( DWORD mask ) __attribute__((weak));
+extern void winios_pSetCursor( HWND hwnd, HCURSOR cursor ) __attribute__((weak));
+extern void winios_pDestroyCursorIcon( HCURSOR cursor ) __attribute__((weak));
+extern void winios_pDestroyWindow( HWND hwnd ) __attribute__((weak));
+extern UINT winios_pShowWindow( HWND hwnd, INT cmd, RECT *rect, UINT swp ) __attribute__((weak));
+extern void winios_pWindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                                      const struct window_rects *new_rects, struct window_surface *surface ) __attribute__((weak));
+
+static struct user_driver_funcs winios_user_driver;
+
+/* C bridge for Winios.m to inject mouse input without pulling in Wine
+ * headers into Obj-C (where INPUT/HWND/etc. would conflict with UIKit
+ * types). Call this from pProcessEvents drain or directly from a
+ * deferred Swift dispatch — it just packages an INPUT_MOUSE event and
+ * hands it to NtUserSendHardwareInput. */
+void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_data, HWND hwnd)
+{
+    INPUT input;
+    input.type           = INPUT_MOUSE;
+    input.mi.dx          = x;
+    input.mi.dy          = y;
+    input.mi.mouseData   = mouse_data;
+    input.mi.dwFlags     = flags;
+    input.mi.time        = 0;
+    input.mi.dwExtraInfo = 0;
+
+    /* Pass hwnd=NULL — the server then hit-tests via shallow_window_from_point
+     * which walks the desktop's children (where the game's window lives).
+     * Passing the desktop handle goes through window_thread_from_point on
+     * the detached desktop window and returns NULL, dropping the message. */
+    BOOL ret = NtUserSendHardwareInput( NULL, 0, &input, 0 );
+    {
+        static unsigned cnt;
+        if (cnt++ < 20)
+            dprintf(2, "[winios] drv_post_mouse hwnd=%p flags=0x%x x=%d y=%d -> %d\n",
+                    hwnd, flags, x, y, ret);
+    }
+}
+#endif
+
 static INT nulldrv_AbortDoc( PHYSDEV dev )
 {
     return 0;
@@ -754,6 +806,53 @@ static UINT nulldrv_UpdateDisplayDevices( const struct gdi_device_manager *manag
     return STATUS_NOT_IMPLEMENTED;
 }
 
+#ifdef WINE_IOS
+/* winios.drv: register a single 1024×768 monitor matching the values
+ * sysparams_ios.c returns for SM_CXSCREEN/CYSCREEN. Wine uses this for
+ * EnumDisplayDevices, EnumDisplayMonitors, GetDeviceCaps, and the
+ * registry-backed monitor records. Without it, Wine derives broken
+ * geometry from the (zero-initialized) winstation monitor list. */
+/* NOTE: This is wired into winios_user_driver.pUpdateDisplayDevices but
+ * is currently DORMANT on iOS. sysparams_ios.c:lock_display_devices has
+ * an `is_service_process()` shortcut that bypasses Wine's full display
+ * enumeration and uses a hardcoded `virtual_monitor` (also 1024x768).
+ * This implementation is ready for when we remove that shortcut to
+ * support real games' EnumDisplayDevices/ChangeDisplaySettings calls. */
+static UINT winios_UpdateDisplayDevices( const struct gdi_device_manager *manager, void *param )
+{
+    /* Single virtual GPU: vendor 0x1002 (AMD) + a placeholder device id —
+     * Wine's user32/dxgi only check vendor/device for filter logic; the
+     * exact values don't matter for our render path. */
+    struct pci_id pci_id = { .vendor = 0x1002, .device = 0x67df, .subsystem = 0, .revision = 0 };
+    manager->add_gpu( "winios GPU", &pci_id, NULL, param );
+
+    /* Single source/adapter, attached + primary. */
+    manager->add_source( "winios0", 0x00000005 /* DISPLAY_DEVICE_ATTACHED|PRIMARY */,
+                         96 /* dpi */, param );
+
+    /* Single monitor at (0,0)–(1024,768). */
+    struct gdi_monitor monitor = {
+        .rc_monitor = { 0, 0, 1024, 768 },
+        .rc_work    = { 0, 0, 1024, 768 },
+        .edid       = NULL,
+        .edid_len   = 0,
+        .hdr_enabled = FALSE,
+    };
+    manager->add_monitor( &monitor, param );
+
+    /* Single 1024×768×32 mode at 60 Hz. */
+    DEVMODEW current = { .dmSize = sizeof(current) };
+    current.dmFields = DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+    current.dmBitsPerPel = 32;
+    current.dmPelsWidth = 1024;
+    current.dmPelsHeight = 768;
+    current.dmDisplayFrequency = 60;
+    manager->add_modes( &current, 1, &current, param );
+
+    return STATUS_SUCCESS;
+}
+#endif
+
 static BOOL nulldrv_CreateDesktop( const WCHAR *name, UINT width, UINT height )
 {
     return TRUE;
@@ -1020,13 +1119,29 @@ static void load_display_driver(void)
              * (set by __wine_set_user_driver via SET_USER_FUNC fallback).
              * The nodrv_CreateWindow returns FALSE for any non-HWND_MESSAGE
              * window, which would abort CreateWindowEx. We don't want that
-             * — we have our own iOS UI bridge for actual rendering. */
+             * — winios.drv (below) takes over actual window/input bridging. */
 #else
             null_user_driver.pCreateWindow = nodrv_CreateWindow;
 #endif
         }
 
+#ifdef WINE_IOS
+        /* Wire up winios.drv slots from the weak externs above. Slots
+         * with no implementation linked (weak ref == NULL) stay NULL
+         * and SET_USER_FUNC falls back to nulldrv_*. Real impls live
+         * in app/Mythic/Winios/Winios.m and link in via Mythic.app. */
+        if (winios_pCreateWindow)        winios_user_driver.pCreateWindow        = winios_pCreateWindow;
+        if (winios_pDestroyWindow)       winios_user_driver.pDestroyWindow       = winios_pDestroyWindow;
+        if (winios_pProcessEvents)       winios_user_driver.pProcessEvents       = winios_pProcessEvents;
+        if (winios_pSetCursor)           winios_user_driver.pSetCursor           = winios_pSetCursor;
+        if (winios_pDestroyCursorIcon)   winios_user_driver.pDestroyCursorIcon   = winios_pDestroyCursorIcon;
+        if (winios_pShowWindow)          winios_user_driver.pShowWindow          = winios_pShowWindow;
+        if (winios_pWindowPosChanged)    winios_user_driver.pWindowPosChanged    = winios_pWindowPosChanged;
+        winios_user_driver.pUpdateDisplayDevices = winios_UpdateDisplayDevices;
+        __wine_set_user_driver( &winios_user_driver, WINE_GDI_DRIVER_VERSION );
+#else
         __wine_set_user_driver( &null_user_driver, WINE_GDI_DRIVER_VERSION );
+#endif
     }
 }
 

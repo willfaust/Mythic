@@ -40,6 +40,7 @@
 		A1000054 /* MetalFX.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000054; };
 		A1000055 /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000055; };
 		A1000060 /* libwin32u_unix.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000060; };
+		A1000070 /* Winios.m in Sources */ = {isa = PBXBuildFile; fileRef = A2000070; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -86,6 +87,8 @@
 		A2000054 /* MetalFX.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalFX.framework; path = System/Library/Frameworks/MetalFX.framework; sourceTree = SDKROOT; };
 		A2000055 /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = "libsqlite3.tbd"; path = "usr/lib/libsqlite3.tbd"; sourceTree = SDKROOT; };
 		A2000060 /* libwin32u_unix.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libwin32u_unix.a; sourceTree = "<group>"; };
+		A2000070 /* Winios.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = Winios/Winios.m; sourceTree = "<group>"; };
+		A2000071 /* Winios.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = Winios/Winios.h; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -149,6 +152,8 @@
 				A2000043 /* PrefixExtractor.h */,
 				A2000050 /* IOSDisplayShim.m */,
 				A2000056 /* IOSDisplayShim.h */,
+				A2000070 /* Winios.m */,
+				A2000071 /* Winios.h */,
 				A2000034 /* wine_stubs.c */,
 				A2000006 /* Mythic-Bridging-Header.h */,
 				A2000007 /* Mythic.entitlements */,
@@ -272,6 +277,7 @@
 				A1000033 /* wine_stubs.c in Sources */,
 				A1000041 /* PrefixExtractor.c in Sources */,
 				A1000050 /* IOSDisplayShim.m in Sources */,
+				A1000070 /* Winios.m in Sources */,
 				A1000035 /* StikJITHelper.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

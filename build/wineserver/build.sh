@@ -73,7 +73,7 @@ PATCHED_FILES=(
     "mapping:$BUILD_DIR/mapping_ios.c:mapping.o"
     "class:$WINE_SRC/server/class.c:class.o"
     "region:$WINE_SRC/server/region.c:region.o"
-    "queue:$WINE_SRC/server/queue.c:queue.o"
+    "queue:$BUILD_DIR/queue_ios.c:queue.o"
 )
 
 echo "=== Building kill wrapper (without kill macro) ==="

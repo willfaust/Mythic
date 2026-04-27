@@ -145,7 +145,7 @@ static void *wine_process_thread(void *arg) {
 
         // Phase 3B: run the D3D11 triangle test so DXMT's PE/unix graphics
         // path gets exercised (swapchain → HWND → CAMetalLayer → present).
-        char *argv[] = { "wine", "C:\\windows\\system32\\texquad.exe", NULL };
+        char *argv[] = { "wine", "C:\\windows\\system32\\cube.exe", NULL };
         int argc = 2;
 
         // Record this thread so wine_ios_exit knows where to longjmp

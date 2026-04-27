@@ -650,6 +650,33 @@ static struct window *create_window( struct window *parent, struct window *owner
                 desktop->top_window->style = WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
                 parent = desktop->top_window;
                 clear_error();
+                /* Mark our winstation visible so hardware-input dispatch
+                 * (get_visible_winstation, set_input_desktop) accepts the
+                 * synthesized touch events from winios.drv. Wine normally
+                 * only flags WinSta0 visible, but is_service_process()=TRUE
+                 * on iOS routes us into a non-WinSta0 default. */
+                if (desktop->winstation)
+                {
+                    desktop->winstation->flags |= 1 /* WSF_VISIBLE */;
+                    desktop->winstation->input_desktop = desktop;
+                }
+                /* iOS: monitors_get_union_rect returns (0,0,0,0) since we
+                 * never report a monitor. That makes cursor.clip degenerate
+                 * and update_desktop_cursor_pos clips every (x,y) to (0,0),
+                 * dropping all hardware mouse coords. Initialize the desktop
+                 * shared cursor.clip directly to match SM_CXSCREEN/CYSCREEN
+                 * (1024x768 in sysparams_ios.c). */
+                {
+                    desktop_shm_t *desktop_shm = desktop->shared;
+                    SHARED_WRITE_BEGIN( desktop_shm, desktop_shm_t )
+                    {
+                        shared->cursor.clip.left = 0;
+                        shared->cursor.clip.top = 0;
+                        shared->cursor.clip.right = 1024;
+                        shared->cursor.clip.bottom = 768;
+                    }
+                    SHARED_WRITE_END;
+                }
             }
             else
 #endif
@@ -2340,6 +2367,31 @@ DECL_HANDLER(get_desktop_window)
         {
             detach_window_thread( desktop->top_window );
             desktop->top_window->style  = WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
+#ifdef WINE_IOS
+            /* See companion patch in create_window: ensure winstation is
+             * marked visible + has an input desktop so hardware-input
+             * dispatch can deliver winios.drv-synthesized touches. */
+            if (desktop->winstation)
+            {
+                desktop->winstation->flags |= 1 /* WSF_VISIBLE */;
+                desktop->winstation->input_desktop = desktop;
+            }
+            /* Initialize cursor.clip to screen size — monitors_get_union_rect
+             * returns (0,0,0,0) on iOS so update_desktop_cursor_pos clips
+             * every (x,y) to (0,0) by default. Hardcode 1024x768 to match
+             * sysparams_ios.c SM_CXSCREEN/CYSCREEN. */
+            {
+                desktop_shm_t *desktop_shm = desktop->shared;
+                SHARED_WRITE_BEGIN( desktop_shm, desktop_shm_t )
+                {
+                    shared->cursor.clip.left = 0;
+                    shared->cursor.clip.top = 0;
+                    shared->cursor.clip.right = 1024;
+                    shared->cursor.clip.bottom = 768;
+                }
+                SHARED_WRITE_END;
+            }
+#endif
         }
     }
 

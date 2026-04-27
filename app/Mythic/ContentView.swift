@@ -5,8 +5,16 @@ import Metal
 import os.log
 
 // UIView whose backing layer is a CAMetalLayer (what DXMT renders into).
+// Also captures touches and forwards them to winios.drv as mouse events.
 final class MetalBackedView: UIView {
     override class var layerClass: AnyClass { return CAMetalLayer.self }
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        self.isMultipleTouchEnabled = false
+        self.isUserInteractionEnabled = true
+    }
+    required init?(coder: NSCoder) { super.init(coder: coder) }
+
     override func layoutSubviews() {
         super.layoutSubviews()
         if let layer = self.layer as? CAMetalLayer {
@@ -15,6 +23,38 @@ final class MetalBackedView: UIView {
             let h = max(1, bounds.height * scale)
             layer.drawableSize = CGSize(width: w, height: h)
         }
+    }
+
+    // Map touch point in view-local UI points to the 1024×768 logical
+    // surface DXMT swapchains use, then post to winios.drv.
+    private func mapTouch(_ touch: UITouch) -> (Int32, Int32) {
+        let p = touch.location(in: self)
+        let w = max(1, bounds.width)
+        let h = max(1, bounds.height)
+        let x = Int32(p.x * 1024 / w)
+        let y = Int32(p.y * 768  / h)
+        return (x, y)
+    }
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let t = touches.first else { return }
+        let (x, y) = mapTouch(t)
+        LogStore.shared.log("[swift] touchesBegan x=\(x) y=\(y)", level: .info)
+        winios_post_touch_down(x, y)
+    }
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let t = touches.first else { return }
+        let (x, y) = mapTouch(t)
+        winios_post_touch_move(x, y)
+    }
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let t = touches.first else { return }
+        let (x, y) = mapTouch(t)
+        winios_post_touch_up(x, y)
+    }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let t = touches.first else { return }
+        let (x, y) = mapTouch(t)
+        winios_post_touch_up(x, y)
     }
 }
 
@@ -454,7 +494,7 @@ struct ContentView: View {
             // Step 4: Wait for Wine to finish instead of fixed timer
             // Poll wine_process_is_running() — it clears when __wine_main returns
             logStore.log("Waiting for Wine to finish PE loading...")
-            let maxWait = 60.0  // safety cap
+            let maxWait = 20.0  // safety cap
             let pollStart = CFAbsoluteTimeGetCurrent()
             while wine_process_is_running() != 0 {
                 Thread.sleep(forTimeInterval: 0.25)
