@@ -3271,7 +3271,12 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
     {
         /* changes to the file are not guaranteed to be visible in read-only MAP_PRIVATE mappings,
          * but they are on Linux so we take advantage of it */
-#ifdef __linux__
+#if defined(__linux__) || defined(WINE_IOS)
+        /* iOS: must use MAP_PRIVATE + keep PROT_WRITE so subsequent
+         * NtProtectVirtualMemory calls (e.g. for IAT writes in .rdata) work.
+         * MAP_SHARED file mappings on iOS reject mprotect upgrades with
+         * EINVAL, breaking Wine's PE loader assumption that read-only
+         * sections can be temporarily flipped writable. */
         flags |= MAP_PRIVATE;
 #else
         flags |= MAP_SHARED;
@@ -4194,6 +4199,9 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
             sec[si].Name, sec_addr, (unsigned long)sec_size);
         mprotect_exec(sec_addr, sec_size, prot);
     }
+    /* iOS: data sections were mapped MAP_PRIVATE + PROT_READ|PROT_WRITE
+     * (see map_file_into_view) so they're already mprotect-able. No
+     * post-hoc fixup needed. */
 #endif
 
 done:
