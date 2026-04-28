@@ -1583,6 +1583,30 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                 ERR("  insn=0x%08x\n", *(uint32_t*)(uintptr_t)PC_sig(context));
             else
                 ERR("  insn=<unmappable PC, skipping read>\n");
+            /* For tiny PC SEGVs through arm64x_check_call: probe LR-4 to
+             * find the BLR that set up x11, and dump EC bitmap bit for x11
+             * so we can see whether the bitmap fast-path should have taken
+             * us out of arm64x_check_call. */
+            if ((uintptr_t)PC_sig(context) < 0x100000000ULL)
+            {
+                extern PEB *peb;
+                uintptr_t lr_val = (uintptr_t)REGn_sig(30, context);
+                uintptr_t x11_at_seg = (uintptr_t)REGn_sig(11, context);
+                ERR("  x11=%p lr=%p\n", (void*)x11_at_seg, (void*)lr_val);
+                if (peb && peb->EcCodeBitMap && x11_at_seg >= 0x100000000ULL)
+                {
+                    uint64_t *bm = (uint64_t *)peb->EcCodeBitMap;
+                    size_t page = x11_at_seg >> 12;
+                    size_t blk  = page / 64;
+                    int bit_in_blk = page & 63;
+                    uint64_t blk_val = bm[blk];
+                    int bit_set = (blk_val >> bit_in_blk) & 1;
+                    ERR("  EcBitMap@%p: x11_page=0x%lx blk[%lx]=%llx bit=%d %s\n",
+                        bm, (unsigned long)page, (unsigned long)blk,
+                        (unsigned long long)blk_val, bit_set,
+                        bit_set ? "(EC: fast-path SHOULD have taken)" : "(NOT EC: dispatch path taken)");
+                }
+            }
             /* Dump cpu_area (TEB.ChpeV2CpuAreaInfo) when PC is unmappable.
              * x17 typically holds cpu_area after enter_jit's chained loads,
              * so when we hit a tiny PC right after BR x16, x17 should still
