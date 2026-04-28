@@ -239,8 +239,14 @@ void ios_jit_set_text_section(void *pe_base, size_t text_offset, size_t text_siz
     {
         if (ios_jit_mappings[i].pe_base == pe_base)
         {
-            ios_jit_mappings[i].text_offset = text_offset;
-            ios_jit_mappings[i].text_size = text_size;
+            /* Keep the LARGEST executable section. ARM64EC PEs have both
+             * .text (large, ARM64 native) and .hexpthk (small, x86_64
+             * fast-forward thunks). The x18 patcher needs to walk .text. */
+            if (text_size > ios_jit_mappings[i].text_size)
+            {
+                ios_jit_mappings[i].text_offset = text_offset;
+                ios_jit_mappings[i].text_size = text_size;
+            }
             return;
         }
     }
