@@ -1606,6 +1606,40 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                         (unsigned long long)blk_val, bit_set,
                         bit_set ? "(EC: fast-path SHOULD have taken)" : "(NOT EC: dispatch path taken)");
                 }
+                /* Dump the first 12 bytes at x11 (the called function's prologue)
+                 * and at JIT-pool ntdll's __wine_dbg_header offset 0x5ed5c (the
+                 * `ldr x11, [x18, #0x60]` instruction) to see whether our x18
+                 * patcher replaced it with a B to a trampoline. */
+                if (x11_at_seg >= 0x100000000ULL)
+                {
+                    uint32_t *p = (uint32_t *)x11_at_seg;
+                    ERR("  callee prologue: %08x %08x %08x %08x\n",
+                        p[0], p[1], p[2], p[3]);
+                    /* If x11 is in __wine_dbg_header (0x5ed24), the LDR at
+                     * +0x38 = +0xe (instr 14) is the patched one. Show it. */
+                    uint32_t patched = p[14];
+                    ERR("  callee[+0x38]=%08x (LDR x11,[x18,#0x60] should be B-tramp if patched)\n",
+                        patched);
+                    /* If patched is a B (top 6 bits = 0x05 = 0b000101), decode
+                     * the target and dump trampoline bytes there. */
+                    if ((patched >> 26) == 5)
+                    {
+                        int32_t imm26 = (int32_t)(patched & 0x3FFFFFF);
+                        if (imm26 & 0x2000000) imm26 |= (int32_t)0xFC000000; /* sign-ext */
+                        intptr_t b_target = (intptr_t)(&p[14]) + ((intptr_t)imm26 << 2);
+                        if (b_target >= 0x100000000LL)
+                        {
+                            uint32_t *t = (uint32_t *)b_target;
+                            ERR("  tramp@%p: %08x %08x %08x %08x %08x %08x %08x\n",
+                                (void*)b_target, t[0], t[1], t[2], t[3], t[4], t[5], t[6]);
+                        }
+                        else
+                        {
+                            ERR("  tramp_target=%p (out of range, B-encoding bad)\n",
+                                (void*)b_target);
+                        }
+                    }
+                }
             }
             /* Dump cpu_area (TEB.ChpeV2CpuAreaInfo) when PC is unmappable.
              * x17 typically holds cpu_area after enter_jit's chained loads,
