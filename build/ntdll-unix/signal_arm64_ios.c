@@ -1593,6 +1593,23 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                 uintptr_t lr_val = (uintptr_t)REGn_sig(30, context);
                 uintptr_t x11_at_seg = (uintptr_t)REGn_sig(11, context);
                 ERR("  x11=%p lr=%p\n", (void*)x11_at_seg, (void*)lr_val);
+                /* Decode the branch instruction at lr-4 to identify which
+                 * register held the BR target at the time of the branch. */
+                if (lr_val >= 0x100000004ULL)
+                {
+                    uint32_t branch_insn = *(uint32_t*)(lr_val - 4);
+                    ERR("  branch@(lr-4)=%08x", branch_insn);
+                    /* BR/BLR encoding: D61F0xxx (BR) or D63F0xxx (BLR) where
+                     * bits 9:5 = Rn. */
+                    if ((branch_insn & 0xFFFE0FFF) == 0xD61F0000) {
+                        int rn = (branch_insn >> 5) & 0x1f;
+                        ERR("    → BR x%d", rn);
+                    } else if ((branch_insn & 0xFFFE0FFF) == 0xD63F0000) {
+                        int rn = (branch_insn >> 5) & 0x1f;
+                        ERR("    → BLR x%d", rn);
+                    }
+                    ERR("\n");
+                }
                 if (peb && peb->EcCodeBitMap && x11_at_seg >= 0x100000000ULL)
                 {
                     uint64_t *bm = (uint64_t *)peb->EcCodeBitMap;
@@ -1637,6 +1654,22 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                         {
                             ERR("  tramp_target=%p (out of range, B-encoding bad)\n",
                                 (void*)b_target);
+                        }
+                    }
+                    /* Search the whole prologue for any instructions where bits
+                     * encode 0x39cc-style tiny RVA — could the prologue itself
+                     * contain a corrupted instruction whose immediate field is
+                     * the target we ended up at? */
+                    {
+                        uintptr_t bad_pc = (uintptr_t)PC_sig(context);
+                        for (int s = 0; s < 32; s++)
+                        {
+                            if ((p[s] & 0xfffff) == (bad_pc & 0xfffff))
+                            {
+                                ERR("  callee[+0x%02x]=%08x has imm matching bad PC low20\n",
+                                    s*4, p[s]);
+                                break;
+                            }
                         }
                     }
                 }
