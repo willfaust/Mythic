@@ -2035,6 +2035,20 @@ static void start_main_thread(void)
         uintptr_t tsd_base;
         __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tsd_base));
         tsd_base &= ~7ULL;
+        /* FEX (libarm64ecfex.dll/xtajit64) hardcodes TSD slot 275 (offset 0x898).
+         * pthread_key_create may give us a different slot (e.g. 276 = 0x8a0) on
+         * iOS depending on what Apple frameworks already reserved. To make
+         * xtajit64's enter_jit / DispatchJump / etc. work, also mirror our TEB
+         * pointer into slot 275 directly. Save the prior value so we can
+         * restore on shutdown if needed (best-effort — Apple's libsystem may
+         * have used this slot, and overwriting could break that usage). */
+        {
+            void **slot275 = (void **)(tsd_base + 275 * 8);
+            void *prev = *slot275;
+            *slot275 = teb;
+            dprintf(STDERR_FILENO, "[Wine init] TEB also mirrored to slot 275 (was %p, now %p)\n",
+                    prev, teb);
+        }
         for (int s = 0; s < 512; s++)
         {
             if (*(void **)(tsd_base + s * 8) == teb)

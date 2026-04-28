@@ -1257,6 +1257,14 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
         cpu_area->EmulatorStackBase  = (ULONG_PTR)stack.StackBase;
         cpu_area->EmulatorStackLimit = (ULONG_PTR)stack.StackLimit + page_size;
         teb->ChpeV2CpuAreaInfo = cpu_area;
+        ERR("iOS arm64ec: TEB %p ChpeV2CpuAreaInfo=%p (stackBase=%p stackLimit=%p ContextAmd64=%p)\n",
+            teb, cpu_area, (void*)cpu_area->EmulatorStackBase, (void*)cpu_area->EmulatorStackLimit,
+            cpu_area->ContextAmd64);
+    }
+    else
+    {
+        ERR("iOS arm64ec: NOT setting cpu_area (is_arm64ec=%d main_machine=0x%x)\n",
+            is_arm64ec(), main_image_info.Machine);
     }
 #endif
 

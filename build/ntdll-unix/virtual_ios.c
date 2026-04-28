@@ -37,6 +37,24 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
+#ifdef WINE_IOS
+/* Minimal Mach API decls to avoid <mach/mach.h>'s host_page_size symbol
+ * clash with our static var of the same name. */
+typedef int kern_return_t;
+typedef unsigned int mach_port_t;
+typedef unsigned long vm_address_t;
+typedef unsigned long vm_size_t;
+typedef int vm_prot_t;
+extern mach_port_t mach_task_self_;
+#define mach_task_self() mach_task_self_
+#define KERN_SUCCESS 0
+#define VM_PROT_READ  ((vm_prot_t) 0x01)
+#define VM_PROT_WRITE ((vm_prot_t) 0x02)
+#define VM_PROT_COPY  ((vm_prot_t) 0x10)
+extern kern_return_t vm_protect(mach_port_t target_task, vm_address_t address,
+                                vm_size_t size, int set_maximum,
+                                vm_prot_t new_protection);
+#endif
 #ifdef HAVE_SYS_SYSINFO_H
 # include <sys/sysinfo.h>
 #endif
@@ -1833,6 +1851,8 @@ static inline UINT64 maskbits( size_t idx )
 /***********************************************************************
  *           set_arm64ec_range
  */
+static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vprot );  /* fwd-decl */
+
 static void set_arm64ec_range( const void *addr, size_t size )
 {
     UINT64 *map = arm64ec_view->base;
@@ -2499,6 +2519,30 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
     }
 
 #ifdef WINE_IOS
+    /* iOS-specific: when asked to make pages writable on a file-backed
+     * mapping (e.g. the IAT in xtajit64's .rdata), POSIX mprotect succeeds
+     * but the kernel silently keeps pages read-only (writes silently
+     * no-op). The Mach vm_protect API succeeds where POSIX silently fails.
+     *
+     * Apply only on the PROT_WRITE-add path; non-write protect changes go
+     * through the regular mprotect below. */
+    ERR("mprotect_exec(%p, 0x%lx, %c%c%c)\n", base, (unsigned long)size,
+        (unix_prot & PROT_READ)  ? 'r' : '-',
+        (unix_prot & PROT_WRITE) ? 'w' : '-',
+        (unix_prot & PROT_EXEC)  ? 'x' : '-');
+    if ((unix_prot & PROT_WRITE) && !(unix_prot & PROT_EXEC))
+    {
+        kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)base, size,
+                                      FALSE,  /* set_maximum */
+                                      VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        if (kr == KERN_SUCCESS) {
+            ERR("iOS vm_protect RW+COPY OK at %p+0x%lx\n", base, (unsigned long)size);
+            return 0;
+        }
+        ERR("iOS vm_protect RW failed kr=%d at %p+0x%lx — falling to mprotect\n",
+            kr, base, (unsigned long)size);
+    }
+
     if (unix_prot & PROT_EXEC)
     {
         /* iOS/TXM: mprotect(PROT_EXEC) is blocked. TXM only allows execution
@@ -2587,6 +2631,25 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 {
                     ERR("iOS JIT: %p already in mapping %d (%p+0x%lx)\n",
                         base, i, (void*)mb, (unsigned long)ios_jit_mappings[i].size);
+                    /* If write was requested (e.g. IAT lives in a section that
+                     * the linker also marked EXEC), grant RW on the PE-side
+                     * page via Mach vm_protect. The JIT pool already has the
+                     * executable copy at the original RX address; we don't
+                     * need EXEC here. After writes land, NtProtectVirtualMemory's
+                     * IAT-sync handler copies them to the JIT pool. */
+                    if (unix_prot & PROT_WRITE)
+                    {
+                        kern_return_t kr = vm_protect(mach_task_self(),
+                            (vm_address_t)base, size, FALSE,
+                            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                        if (kr == KERN_SUCCESS) {
+                            ERR("iOS vm_protect RW+COPY OK at %p+0x%lx (was rwx)\n",
+                                base, (unsigned long)size);
+                            return 0;
+                        }
+                        ERR("iOS vm_protect RW failed kr=%d at %p+0x%lx (was rwx)\n",
+                            kr, base, (unsigned long)size);
+                    }
                     mprotect( base, size, PROT_READ );
                     return 0;
                 }
@@ -2639,6 +2702,27 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 image_base, (unsigned long)image_size, (char *)jit_rx_base + offset,
                 (unsigned long)offset,
                 (unsigned long)(offset + alloc_size), (unsigned long)jit_pool_size);
+
+            /* Mark the JIT-pool range as ARM64EC code in the EcCodeBitMap.
+             * Without this, PE-side update_arm64ec_ranges only sets bits for
+             * the unix-mapped address range (e.g. 0xebf6a0000+), but code
+             * actually executes from the JIT pool. arm64x_check_call would
+             * then see the JIT-pool target as non-EC and route everything
+             * through ExitToX64 → enter_jit (which needs FEX init).
+             * First commit the bitmap pages backing the JIT-pool range. */
+            if (arm64ec_view)
+            {
+                char *jit_base = (char *)jit_rx_base + offset;
+                size_t bm_start = ((size_t)jit_base >> page_shift) / 8;
+                size_t bm_end   = (((size_t)jit_base + image_size) >> page_shift) / 8;
+                size_t bm_size  = ROUND_SIZE(bm_start, bm_end + 1 - bm_start, page_mask);
+                void *bm_page   = ROUND_ADDR((char *)arm64ec_view->base + bm_start, page_mask);
+                set_vprot(arm64ec_view, bm_page, bm_size,
+                          VPROT_READ | VPROT_WRITE | VPROT_COMMITTED);
+                set_arm64ec_range(jit_base, image_size);
+                ERR("iOS JIT: set_arm64ec_range(jit %p+0x%lx) bm=%p+0x%lx\n",
+                    jit_base, (unsigned long)image_size, bm_page, (unsigned long)bm_size);
+            }
 
             /* Make data sections in JIT pool writable by remapping from RW view.
              * Parse PE section headers to find non-executable sections. */
@@ -2784,20 +2868,34 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 /* Patch x18 references in .text → TPIDR_EL0 trampolines.
                  * Allocate trampoline space right after the PE image in the JIT pool.
                  *
-                 * SKIP x18 patching for x86_64 PEs (e.g. ARM64EC guest binaries).
-                 * The x86_64 instruction `push rbp; sub rsp, ...` (bytes 55 48 83 ec)
-                 * encodes as 0xec834855 little-endian, which our ARM64 instruction
-                 * decoder mistakenly recognizes as an x18-using load — corrupting
-                 * the function prologue. Only ARM64 (machine=0xaa64) needs patching. */
+                 * SKIP x18 patching for pure x86_64 PEs only.
+                 * ARM64EC PEs report Machine=AMD64 (0x8664) in their header but their
+                 * .text holds real ARM64 code that DOES need x18 patching. Detect
+                 * ARM64EC by presence of a `.a64xrm` (ARM64EC reloc range map) section. */
                 {
                     char *rw_image = (char *)jit_rw_base + offset;
                     USHORT pe_machine = *(USHORT *)(rw_image + pe_off + 4);
+                    int is_arm64ec_pe = 0;
                     if (pe_machine != IMAGE_FILE_MACHINE_ARM64)
+                    {
+                        /* Walk section headers looking for .a64xrm */
+                        unsigned short num_sec  = *(unsigned short *)(rw_image + pe_off + 6);
+                        unsigned short opt_size = *(unsigned short *)(rw_image + pe_off + 0x14);
+                        char *sh = rw_image + pe_off + 0x18 + opt_size;
+                        for (int s = 0; s < num_sec; s++, sh += 40)
+                        {
+                            if (!memcmp(sh, ".a64xrm", 7)) { is_arm64ec_pe = 1; break; }
+                        }
+                    }
+                    if (pe_machine != IMAGE_FILE_MACHINE_ARM64 && !is_arm64ec_pe)
                     {
                         ERR("iOS JIT: skipping x18 patcher for non-ARM64 PE (Machine=0x%x)\n",
                             pe_machine);
                         goto x18_patch_done;
                     }
+                    if (is_arm64ec_pe)
+                        ERR("iOS JIT: x18-patching ARM64EC PE (Machine=0x%x has .a64xrm)\n",
+                            pe_machine);
                 }
                 {
                     /* Find .text section info from mapping table */
@@ -2949,6 +3047,9 @@ static void commit_arm64ec_map( struct file_view *view )
 
     view->protect |= VPROT_ARM64EC;
     set_vprot( arm64ec_view, base, size, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED );
+    ERR("commit_arm64ec_map: view@%p+0x%lx → bitmap %p+0x%lx (start_byte=0x%lx)\n",
+        view->base, (unsigned long)view->size, base, (unsigned long)size,
+        (unsigned long)start);
 }
 
 
@@ -3721,6 +3822,8 @@ static void alloc_arm64ec_map(void)
         exit(1);
     }
     peb->EcCodeBitMap = arm64ec_view->base;
+    ERR("alloc_arm64ec_map: peb->EcCodeBitMap=%p size=0x%lx\n",
+        peb->EcCodeBitMap, (unsigned long)size);
 }
 
 
@@ -3961,6 +4064,21 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     TRACE_(module)( "mapping PE file %s at %p-%p\n", debugstr_us(nt_name), ptr, ptr + total_size );
 
     /* Verbose per-section logging removed; error paths still log */
+
+#ifdef WINE_IOS
+    /* iOS: server hands us a high ASLR map_addr (e.g. 0x6fffff880000) that the
+     * iOS user-space-limit rejects, so map_view falls back to a low address
+     * (e.g. 0xebf6a0000). Wine's perform_relocations below uses
+     * (image_info->map_addr - image_info->base) for delta — that produces the
+     * WRONG delta if map_addr disagrees with ptr. Force them to match so all
+     * ARM64 PC-relative relocations (ADRP/ADR/BRANCH26) target real addresses. */
+    if (image_info->map_addr && (uintptr_t)ptr != image_info->map_addr)
+    {
+        ERR("iOS: forcing map_addr 0x%lx -> %p (actual view base) so reloc delta is correct\n",
+            (unsigned long)image_info->map_addr, ptr);
+        image_info->map_addr = (uintptr_t)ptr;
+    }
+#endif
 
     /* map the header */
 
@@ -6200,6 +6318,15 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
 
     TRACE("%p %p %08lx %x %08x\n", process, *ret, *size_ptr, type, protect );
 
+#ifdef WINE_IOS
+    {
+        static int alloc_dbg = 0;
+        if (alloc_dbg++ < 30 || (protect & 0xF0))
+            ERR("NtAllocateVirtualMemory: size=0x%lx type=0x%x prot=0x%x\n",
+                (unsigned long)*size_ptr, type, protect);
+    }
+#endif
+
     if (!*size_ptr) return STATUS_INVALID_PARAMETER;
     if (zero_bits > 21 && zero_bits < 32) return STATUS_INVALID_PARAMETER_3;
     if (zero_bits > 32 && zero_bits < granularity_mask) return STATUS_INVALID_PARAMETER_3;
@@ -6350,6 +6477,15 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
                                   &align, &attributes, &machine );
     if (status) return status;
 
+#ifdef WINE_IOS
+    {
+        static int alloc_ex_dbg = 0;
+        if (alloc_ex_dbg++ < 30)
+            ERR("NtAllocateVirtualMemoryEx: size=0x%lx type=0x%x prot=0x%x attrs=0x%x machine=0x%x param_count=%u\n",
+                (unsigned long)*size_ptr, type, protect, attributes, machine, count);
+    }
+#endif
+
     if (type & ~type_mask) return STATUS_INVALID_PARAMETER;
     if (*ret && (align || limit_low || limit_high)) return STATUS_INVALID_PARAMETER;
     if (!*size_ptr) return STATUS_INVALID_PARAMETER;
@@ -6495,13 +6631,29 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
     DWORD old;
 
 #ifdef WINE_IOS
-    addr = (LPVOID)ios_jit_reverse_translate_addr(addr);
+    {
+        LPVOID orig_addr = addr;
+        addr = (LPVOID)ios_jit_reverse_translate_addr(addr);
+        ERR("NtProtectVirtualMemory(orig=%p reversed=%p sz=0x%lx prot=0x%x)\n",
+            orig_addr, addr, (unsigned long)*size_ptr, new_prot);
+    }
 #endif
 
     TRACE("%p %p %08lx %08x\n", process, addr, size, new_prot );
 
+#ifdef WINE_IOS
+    /* iOS: relax the NULL-old_prot rejection. Wine PE-side ntdll's arm64ec
+     * notify-memory-protect path passes NULL when the caller doesn't care
+     * about the old prot. Standard Windows would reject this with AV, but on
+     * iOS that breaks our IAT-sync (which needs the protect change to apply)
+     * — the JIT-pool slots stay zero, exit thunks BLR to garbage and SEGV.
+     * Substitute a local sink so the protection change + IAT sync still run. */
+    DWORD ios_old_prot_sink;
+    if (!old_prot) old_prot = &ios_old_prot_sink;
+#else
     if (!old_prot)
         return STATUS_ACCESS_VIOLATION;
+#endif
 
     if (process != NtCurrentProcess())
     {

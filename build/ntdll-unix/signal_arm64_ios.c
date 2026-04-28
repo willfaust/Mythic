@@ -1545,8 +1545,14 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         /* If x18 is 0 and we have TEB backup, restore it directly.
          * iOS kernel zeroes x18 (platform register) on signal delivery.
          * The binary patcher is the real fix (rewrites x18 refs to use
-         * a safe TEB load sequence). This is just a simple fallback. */
-        if (REGn_sig(18, context) == 0 && ios_teb_for_signals != 0)
+         * a safe TEB load sequence). This is just a simple fallback.
+         *
+         * BUT: if the faulting PC is itself in low/unmapped memory (i.e. we
+         * jumped to an unrelocated RVA), restoring x18 doesn't help — the
+         * next SEGV will fire at the same PC. Fall through to the diagnostic
+         * dump so the real cause is visible. */
+        if (REGn_sig(18, context) == 0 && ios_teb_for_signals != 0
+            && (uintptr_t)pc >= 0x100000000ULL)
         {
             REGn_sig(18, context) = ios_teb_for_signals;
             return;
@@ -1570,9 +1576,35 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                 (void*)REGn_sig(16, context), (void*)REGn_sig(17, context),
                 (void*)REGn_sig(18, context), (void*)REGn_sig(19, context),
                 (void*)REGn_sig(20, context));
-            ERR("  fp=%p lr=%p sp=%p insn=0x%08x\n",
+            ERR("  fp=%p lr=%p sp=%p\n",
                 (void*)FP_sig(context), (void*)REGn_sig(30, context),
-                (void*)SP_sig(context), *(uint32_t*)(uintptr_t)PC_sig(context));
+                (void*)SP_sig(context));
+            if ((uintptr_t)PC_sig(context) >= 0x100000000ULL)
+                ERR("  insn=0x%08x\n", *(uint32_t*)(uintptr_t)PC_sig(context));
+            else
+                ERR("  insn=<unmappable PC, skipping read>\n");
+            /* Dump cpu_area (TEB.ChpeV2CpuAreaInfo) when PC is unmappable.
+             * x17 typically holds cpu_area after enter_jit's chained loads,
+             * so when we hit a tiny PC right after BR x16, x17 should still
+             * have it. Bound-check x17 looks like a ~0x1xxxxxxxx pointer. */
+            if ((uintptr_t)PC_sig(context) < 0x100000000ULL)
+            {
+                uintptr_t cpu_area_p = (uintptr_t)REGn_sig(17, context);
+                if (cpu_area_p >= 0x100000000ULL && cpu_area_p < 0x800000000000ULL)
+                {
+                    uint64_t *ca = (uint64_t *)cpu_area_p;
+                    ERR("  cpu_area@%p: [0x00]=%llx [0x08]=%llx [0x10]=%llx [0x18]=%llx\n",
+                        (void*)cpu_area_p,
+                        (unsigned long long)ca[0], (unsigned long long)ca[1],
+                        (unsigned long long)ca[2], (unsigned long long)ca[3]);
+                    ERR("              [0x20]=%llx [0x28]=%llx [0x30]=%llx [0x38]=%llx\n",
+                        (unsigned long long)ca[4], (unsigned long long)ca[5],
+                        (unsigned long long)ca[6], (unsigned long long)ca[7]);
+                    ERR("              [0x40]=%llx [0x48]=%llx [0x50]=%llx [0x58]=%llx\n",
+                        (unsigned long long)ca[8], (unsigned long long)ca[9],
+                        (unsigned long long)ca[10], (unsigned long long)ca[11]);
+                }
+            }
         }
     }
 #endif
@@ -1814,12 +1846,20 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     bus_count++;
     if (bus_count <= 5)
     {
-        ERR("BUS #%d: pc=%p addr=%p x18=%p x16=%p lr=%p insn=0x%08x\n", bus_count,
-            (void*)PC_sig((ucontext_t*)sigcontext), siginfo->si_addr,
-            (void*)REGn_sig(18, (ucontext_t*)sigcontext),
+        uintptr_t bus_pc_val = (uintptr_t)PC_sig((ucontext_t*)sigcontext);
+        uintptr_t bus_lr_val = (uintptr_t)LR_sig((ucontext_t*)sigcontext);
+        /* iOS user space starts ~0x100000000; anything below is unmapped. */
+        int bus_pc_ok = (bus_pc_val >= 0x100000000ULL);
+        int bus_lr_ok = (bus_lr_val >= 0x100000000ULL + 4);
+        uint32_t bus_insn = bus_pc_ok ? *(uint32_t*)bus_pc_val : 0;
+        uint32_t bus_branch_insn = bus_lr_ok ? *(uint32_t*)(bus_lr_val - 4) : 0;
+        ERR("BUS #%d: pc=%p addr=%p x16=%p x17=%p x18=%p lr=%p insn=0x%08x branch@lr-4=0x%08x%s\n",
+            bus_count, (void*)bus_pc_val, siginfo->si_addr,
             (void*)REGn_sig(16, (ucontext_t*)sigcontext),
-            (void*)LR_sig((ucontext_t*)sigcontext),
-            *(uint32_t*)(uintptr_t)PC_sig((ucontext_t*)sigcontext));
+            (void*)REGn_sig(17, (ucontext_t*)sigcontext),
+            (void*)REGn_sig(18, (ucontext_t*)sigcontext),
+            (void*)bus_lr_val, bus_insn, bus_branch_insn,
+            bus_pc_ok ? "" : " <unmappable PC>");
         /* Dump Mach handler .data fault diagnostic (first fault only) */
         if (bus_count == 1 && ios_exc_data_fault_count > 0)
         {
