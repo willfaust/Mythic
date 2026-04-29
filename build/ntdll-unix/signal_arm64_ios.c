@@ -455,16 +455,27 @@ static void *ios_mach_exception_thread( void *arg )
                 extern void *ios_jit_rx_base_global;
                 extern void *ios_jit_rw_base_global;
                 extern size_t ios_jit_pool_size_global;
+                extern uintptr_t ios_jit_anon_alias_lookup(uintptr_t fault_addr);
                 uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
                 uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
                 size_t sz = ios_jit_pool_size_global;
                 uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
-                if (rx && rw && sz &&
-                    fault_addr >= rx && fault_addr < rx + sz &&
-                    (uintptr_t)fault_pc >= 0x100000000ULL)
+                /* Two cases: (a) fault on JIT pool RX directly, route via the
+                 * RW alias by offset translation. (b) fault on a user-VA that
+                 * was vm_remap'd from JIT pool RX (e.g. FEX CodeBuffer): use
+                 * the secondary alias table to find the user_VA → RW alias
+                 * mapping. */
+                uintptr_t rw_addr = 0;
+                int in_jit = (rx && rw && sz &&
+                              fault_addr >= rx && fault_addr < rx + sz);
+                if (in_jit) {
+                    rw_addr = rw + (fault_addr - rx);
+                } else {
+                    rw_addr = ios_jit_anon_alias_lookup(fault_addr);
+                }
+                if (rw_addr && (uintptr_t)fault_pc >= 0x100000000ULL)
                 {
                     uint32_t insn = *(uint32_t *)(uintptr_t)fault_pc;
-                    uintptr_t rw_addr = rw + (fault_addr - rx);
                     int emulated = 0;
                     /* STR (immediate, unsigned offset, 64-bit): 1111 1001 00 imm12 Rn Rt */
                     if ((insn & 0xffc00000) == 0xf9000000)

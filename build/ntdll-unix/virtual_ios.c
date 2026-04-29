@@ -215,6 +215,45 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
     ios_jit_mapping_count++;
 }
 
+/* iOS-Mythic: secondary user_VA → JIT pool RW alias mapping for anonymous
+ * RWX regions (e.g. FEX CodeBuffer). When user_VA is vm_remap'd from JIT pool
+ * RX, writes via user_VA fault and the STR fault emulator looks up the
+ * corresponding RW alias address here to perform the store. */
+#define IOS_JIT_MAX_ANON_ALIASES 32
+struct ios_jit_anon_alias {
+    uintptr_t user_va;
+    uintptr_t user_va_end;
+    uintptr_t jit_rw_alias;
+};
+static struct ios_jit_anon_alias ios_jit_anon_aliases[IOS_JIT_MAX_ANON_ALIASES];
+static volatile int ios_jit_anon_alias_count = 0;
+
+void ios_jit_anon_alias_add(void *user_va, size_t size, void *jit_rw_alias)
+{
+    int idx = __sync_fetch_and_add(&ios_jit_anon_alias_count, 1);
+    if (idx >= IOS_JIT_MAX_ANON_ALIASES) {
+        ERR("iOS JIT: anon alias table full (idx=%d)\n", idx);
+        return;
+    }
+    ios_jit_anon_aliases[idx].user_va = (uintptr_t)user_va;
+    ios_jit_anon_aliases[idx].user_va_end = (uintptr_t)user_va + size;
+    ios_jit_anon_aliases[idx].jit_rw_alias = (uintptr_t)jit_rw_alias;
+}
+
+uintptr_t ios_jit_anon_alias_lookup(uintptr_t fault_addr)
+{
+    int n = ios_jit_anon_alias_count;
+    int i;
+    for (i = 0; i < n; i++) {
+        if (fault_addr >= ios_jit_anon_aliases[i].user_va &&
+            fault_addr <  ios_jit_anon_aliases[i].user_va_end) {
+            return ios_jit_anon_aliases[i].jit_rw_alias +
+                   (fault_addr - ios_jit_anon_aliases[i].user_va);
+        }
+    }
+    return 0;
+}
+
 void ios_jit_set_reloc_info(void *pe_base, uint64_t pe_image_base, intptr_t delta,
                             unsigned int reloc_rva, unsigned int reloc_size)
 {
@@ -2679,8 +2718,70 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 
             if (!image_base || !image_size)
             {
-                ERR("iOS JIT: couldn't find PE header for %p\n", base);
-                mprotect( base, size, PROT_READ );
+                /* iOS-Mythic: anonymous RWX request (e.g. FEX's CodeBuffer
+                 * allocates a 16MB PAGE_EXECUTE_READWRITE region for runtime
+                 * JIT). No PE header to copy. Strategy: take a slot from the
+                 * JIT pool, vm_remap from `jit_rx_base + offset` into the
+                 * caller's VA (which gives the caller's pages R+X via the
+                 * dual-map), and record a `user_VA -> jit_rw_base + offset`
+                 * alias so the STR-fault emulator routes writes through the
+                 * RW alias. FEX writes via user_VA fault → emulator routes;
+                 * FEX executes via user_VA → R+X works. */
+                size_t page_size = 0x4000;
+                size_t alloc_size = (size + page_size - 1) & ~(page_size - 1);
+                size_t offset = __sync_fetch_and_add(&jit_pool_offset, alloc_size);
+                if (offset + alloc_size > jit_pool_size)
+                {
+                    ERR("iOS JIT: pool exhausted for anon RWX %p+0x%lx\n",
+                        base, (unsigned long)size);
+                    mprotect( base, size, PROT_READ );
+                    return 0;
+                }
+
+                vm_address_t target = (vm_address_t)base;
+                vm_prot_t cur_prot = 0, max_prot = 0;
+                kern_return_t kr = vm_remap(mach_task_self(),
+                    &target, alloc_size, 0,
+                    VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                    mach_task_self(),
+                    (vm_address_t)((char *)jit_rx_base + offset),
+                    FALSE,
+                    &cur_prot, &max_prot,
+                    VM_INHERIT_DEFAULT);
+                if (kr != KERN_SUCCESS)
+                {
+                    ERR("iOS JIT: anon RWX vm_remap failed kr=%d %p+0x%lx\n",
+                        kr, base, (unsigned long)alloc_size);
+                    mprotect( base, size, PROT_READ );
+                    return 0;
+                }
+
+                /* Mark the JIT-pool slot as ARM64EC code so arm64x_check_call
+                 * routes correctly (FEX-emitted code is treated as EC for
+                 * dispatcher purposes). */
+                if (arm64ec_view)
+                {
+                    char *jit_base = (char *)jit_rx_base + offset;
+                    size_t bm_start = ((size_t)jit_base >> page_shift) / 8;
+                    size_t bm_end   = (((size_t)jit_base + alloc_size) >> page_shift) / 8;
+                    size_t bm_size  = ROUND_SIZE(bm_start, bm_end + 1 - bm_start, page_mask);
+                    void *bm_page   = ROUND_ADDR((char *)arm64ec_view->base + bm_start, page_mask);
+                    set_vprot(arm64ec_view, bm_page, bm_size,
+                              VPROT_READ | VPROT_WRITE | VPROT_COMMITTED);
+                    set_arm64ec_range(jit_base, alloc_size);
+                }
+
+                /* Record secondary alias for STR fault emulator. */
+                extern void ios_jit_anon_alias_add(void *user_va, size_t size,
+                                                   void *jit_rw_alias);
+                ios_jit_anon_alias_add(base, alloc_size,
+                                       (char *)jit_rw_base + offset);
+
+                ERR("iOS JIT: anon RWX %p+0x%lx → pool offset 0x%lx (rx=%p rw=%p)"
+                    " cur_prot=0x%x max_prot=0x%x\n",
+                    base, (unsigned long)alloc_size, (unsigned long)offset,
+                    (char *)jit_rx_base + offset, (char *)jit_rw_base + offset,
+                    cur_prot, max_prot);
                 return 0;
             }
 
