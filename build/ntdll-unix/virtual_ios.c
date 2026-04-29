@@ -1931,8 +1931,15 @@ static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vpr
 static void set_arm64ec_range( const void *addr, size_t size )
 {
     UINT64 *map = arm64ec_view->base;
-    size_t idx = (size_t)addr >> page_shift;
-    size_t end = ((size_t)addr + size + page_mask) >> page_shift;
+    /* iOS-Mythic: arm64x_check_call hardcodes 4KB-page indexing per the
+     * Windows ABI (`lsr x11, #12` and `lsr x11, #18`) regardless of host
+     * page size. iOS uses 16KB pages (page_shift=14). Always use a 12-bit
+     * shift here so check_call's reads land at the same bitmap byte we
+     * write to. */
+    const unsigned int ec_page_shift = 12;
+    const size_t ec_page_mask = (1ULL << ec_page_shift) - 1;
+    size_t idx = (size_t)addr >> ec_page_shift;
+    size_t end = ((size_t)addr + size + ec_page_mask) >> ec_page_shift;
     size_t pos = idx / 64;
     size_t end_pos = end / 64;
 
@@ -1952,8 +1959,10 @@ static void set_arm64ec_range( const void *addr, size_t size )
 static void clear_arm64ec_range( const void *addr, size_t size )
 {
     UINT64 *map = arm64ec_view->base;
-    size_t idx = (size_t)addr >> page_shift;
-    size_t end = ((size_t)addr + size + page_mask) >> page_shift;
+    const unsigned int ec_page_shift = 12;
+    const size_t ec_page_mask = (1ULL << ec_page_shift) - 1;
+    size_t idx = (size_t)addr >> ec_page_shift;
+    size_t end = ((size_t)addr + size + ec_page_mask) >> ec_page_shift;
     size_t pos = idx / 64;
     size_t end_pos = end / 64;
 
@@ -2850,8 +2859,9 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 if (arm64ec_view)
                 {
                     char *jit_base = (char *)jit_rx_base + offset;
-                    size_t bm_start = ((size_t)jit_base >> page_shift) / 8;
-                    size_t bm_end   = (((size_t)jit_base + alloc_size) >> page_shift) / 8;
+                    /* iOS-Mythic: 4KB-page indexing per arm64x_check_call ABI */
+                    size_t bm_start = ((size_t)jit_base >> 12) / 8;
+                    size_t bm_end   = (((size_t)jit_base + alloc_size) >> 12) / 8;
                     size_t bm_size  = ROUND_SIZE(bm_start, bm_end + 1 - bm_start, page_mask);
                     void *bm_page   = ROUND_ADDR((char *)arm64ec_view->base + bm_start, page_mask);
                     set_vprot(arm64ec_view, bm_page, bm_size,
@@ -2930,15 +2940,118 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
             if (arm64ec_view && is_arm64ec_hybrid)
             {
                 char *jit_base = (char *)jit_rx_base + offset;
-                size_t bm_start = ((size_t)jit_base >> page_shift) / 8;
-                size_t bm_end   = (((size_t)jit_base + image_size) >> page_shift) / 8;
+                char *rw_image = (char *)jit_rw_base + offset;
+                /* iOS-Mythic: arm64x_check_call uses 4KB-page indexing always.
+                 * Compute bitmap byte offsets with 12-bit shift so committed
+                 * pages cover where set_arm64ec_range will write. */
+                size_t bm_start = ((size_t)jit_base >> 12) / 8;
+                size_t bm_end   = (((size_t)jit_base + image_size) >> 12) / 8;
                 size_t bm_size  = ROUND_SIZE(bm_start, bm_end + 1 - bm_start, page_mask);
                 void *bm_page   = ROUND_ADDR((char *)arm64ec_view->base + bm_start, page_mask);
                 set_vprot(arm64ec_view, bm_page, bm_size,
                           VPROT_READ | VPROT_WRITE | VPROT_COMMITTED);
-                set_arm64ec_range(jit_base, image_size);
-                ERR("iOS JIT: set_arm64ec_range(jit %p+0x%lx) ARM64EC hybrid bm=%p+0x%lx\n",
-                    jit_base, (unsigned long)image_size, bm_page, (unsigned long)bm_size);
+                /* CRITICAL FIX: ARM64EC PEs (ntdll, kernel32, ucrtbase, etc.)
+                 * have INTERMIXED ARM64EC code AND x86_64 syscall stubs in
+                 * their .text section. The IMAGE_ARM64EC_METADATA::CodeMap
+                 * tells us which RVA ranges are which (StartOffset low 2 bits:
+                 * 0=ARM64, 1=ARM64EC, 2=x86_64). Marking the entire image as
+                 * EC causes arm64x_check_call to think x86_64 stubs are EC,
+                 * which makes hybpatch thunks BR x11 directly into x86_64
+                 * bytes (executed as ARM64 → garbage targets). */
+                {
+                    /* Parse the load config to find CHPEMetadataPointer */
+                    unsigned int pe_o = *(unsigned int *)(rw_image + 0x3C);
+                    unsigned short opt_s = *(unsigned short *)(rw_image + pe_o + 0x14);
+                    char *opt_hdr = rw_image + pe_o + 0x18;
+                    /* DataDirectories start at opt_hdr + 0x70 (PE32+) */
+                    /* IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG = 10, offset 10*8=0x50 from data dirs */
+                    unsigned int load_cfg_rva = *(unsigned int *)(opt_hdr + 0x70 + 10*8);
+                    unsigned int load_cfg_size = *(unsigned int *)(opt_hdr + 0x70 + 10*8 + 4);
+                    int found_codemap = 0;
+                    ERR("iOS JIT: load_cfg rva=0x%x size=0x%x\n", load_cfg_rva, load_cfg_size);
+                    if (load_cfg_rva && load_cfg_size > 0xD0)
+                    {
+                        char *load_cfg = rw_image + load_cfg_rva;
+                        /* CHPEMetadataPointer is at offset 0xC8 in IMAGE_LOAD_CONFIG_DIRECTORY64 */
+                        uint64_t chpe_meta_va = *(uint64_t *)(load_cfg + 0xC8);
+                        ERR("iOS JIT: chpe_meta_va=0x%llx pe_image_base=0x%llx\n",
+                            (unsigned long long)chpe_meta_va,
+                            (unsigned long long)*(uint64_t *)(opt_hdr + 0x18));
+                        uint64_t pe_image_base = *(uint64_t *)(opt_hdr + 0x18);
+                        if (chpe_meta_va && chpe_meta_va >= pe_image_base &&
+                            chpe_meta_va < pe_image_base + image_size)
+                        {
+                            uint64_t chpe_meta_rva = chpe_meta_va - pe_image_base;
+                            char *meta = rw_image + chpe_meta_rva;
+                            /* IMAGE_ARM64EC_METADATA: CodeMap RVA at +0x4, CodeMapCount at +0x8 */
+                            unsigned int code_map_rva = *(unsigned int *)(meta + 0x4);
+                            unsigned int code_map_count = *(unsigned int *)(meta + 0x8);
+                            if (code_map_rva && code_map_count)
+                            {
+                                /* IMAGE_CHPE_RANGE_ENTRY: 8 bytes each (StartOffset 32-bit, Length 32-bit) */
+                                char *code_map = rw_image + code_map_rva;
+                                int ec_count = 0, x64_count = 0, arm_count = 0;
+                                for (unsigned int i = 0; i < code_map_count; i++)
+                                {
+                                    unsigned int start = *(unsigned int *)(code_map + i*8);
+                                    unsigned int len   = *(unsigned int *)(code_map + i*8 + 4);
+                                    int range_type = start & 0x3;
+                                    unsigned int rva = start & ~0x3u;
+                                    if (range_type == 1) /* ARM64EC */
+                                    {
+                                        set_arm64ec_range(jit_base + rva, len);
+                                        ec_count++;
+                                    }
+                                    else if (range_type == 2) x64_count++;
+                                    else if (range_type == 0) arm_count++;
+                                }
+                                ERR("iOS JIT: CodeMap parsed: %d ARM64EC ranges, %d x86_64, %d ARM64 entries (total %u)\n",
+                                    ec_count, x64_count, arm_count, code_map_count);
+                                found_codemap = 1;
+                            }
+                        }
+                    }
+                    if (!found_codemap)
+                    {
+                        /* Fallback: mark whole image as EC (old behavior, may misclassify x64 stubs) */
+                        ERR("iOS JIT: no CodeMap found — falling back to coarse-mark whole image\n");
+                        set_arm64ec_range(jit_base, image_size);
+                    }
+                }
+                {
+                    /* iOS-Mythic dual-map RX-side verification.
+                     * Read the first 4 bytes of .text via RX alias and compare
+                     * to the same offset via RW alias (which we just memcpy'd
+                     * to). If they differ, the dual-map isn't aliased correctly
+                     * for this page and FEX/Wine will fetch garbage on BL. */
+                    if (image_size > 0x4000)
+                    {
+                        volatile uint32_t rx_byte0 = *(volatile uint32_t *)((char *)jit_rx_base + offset + 0x4000);
+                        uint32_t rw_byte0 = *(uint32_t *)((char *)jit_rw_base + offset + 0x4000);
+                        ERR("iOS JIT: dual-map RX[+0x4000]=0x%08x  RW[+0x4000]=0x%08x  match=%d\n",
+                            rx_byte0, rw_byte0, rx_byte0 == rw_byte0);
+                        /* Also probe a deeper offset (around middle of image) */
+                        size_t deep = (image_size / 2) & ~3UL;
+                        volatile uint32_t rx_mid = *(volatile uint32_t *)((char *)jit_rx_base + offset + deep);
+                        uint32_t rw_mid = *(uint32_t *)((char *)jit_rw_base + offset + deep);
+                        ERR("iOS JIT: dual-map RX[+0x%lx]=0x%08x  RW[+0x%lx]=0x%08x  match=%d\n",
+                            (unsigned long)deep, rx_mid,
+                            (unsigned long)deep, rw_mid, rx_mid == rw_mid);
+                    }
+                }
+                {
+                    /* Verify start, middle, and end words */
+                    UINT64 *vmap = (UINT64 *)arm64ec_view->base;
+                    size_t s_idx = ((size_t)jit_base) >> 12;
+                    size_t e_idx = ((size_t)jit_base + image_size - 1) >> 12;
+                    size_t m_idx = (s_idx + e_idx) / 2;
+                    UINT64 sw = vmap[s_idx / 64], mw = vmap[m_idx / 64], ew = vmap[e_idx / 64];
+                    ERR("iOS JIT: set_arm64ec_range(jit %p+0x%lx) hybrid bm=%p+0x%lx | start_pos=0x%lx word=0x%llx bit%d=%d | mid_pos=0x%lx word=0x%llx bit%d=%d | end_pos=0x%lx word=0x%llx bit%d=%d\n",
+                        jit_base, (unsigned long)image_size, bm_page, (unsigned long)bm_size,
+                        (unsigned long)(s_idx/64), (unsigned long long)sw, (int)(s_idx&63), (int)((sw>>(s_idx&63))&1),
+                        (unsigned long)(m_idx/64), (unsigned long long)mw, (int)(m_idx&63), (int)((mw>>(m_idx&63))&1),
+                        (unsigned long)(e_idx/64), (unsigned long long)ew, (int)(e_idx&63), (int)((ew>>(e_idx&63))&1));
+                }
             }
             else
             {
@@ -6754,8 +6867,9 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
             extern struct file_view *arm64ec_view;
             if (arm64ec_view)
             {
-                size_t bm_start = ((size_t)jit_rx >> page_shift) / 8;
-                size_t bm_end   = (((size_t)jit_rx + alloc_size) >> page_shift) / 8;
+                /* iOS-Mythic: 4KB-page indexing per arm64x_check_call ABI */
+                size_t bm_start = ((size_t)jit_rx >> 12) / 8;
+                size_t bm_end   = (((size_t)jit_rx + alloc_size) >> 12) / 8;
                 size_t bm_size  = ROUND_SIZE(bm_start, bm_end + 1 - bm_start, page_mask);
                 void *bm_page   = ROUND_ADDR((char *)arm64ec_view->base + bm_start, page_mask);
                 set_vprot(arm64ec_view, bm_page, bm_size,

@@ -357,6 +357,11 @@ static void *ios_mach_exception_thread( void *arg )
         mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
         kr = thread_get_state( thread, ARM_THREAD_STATE64,
                                (thread_state_t)&state, &count );
+        /* Also fetch NEON (SIMD/FP) state for STR/STP-q emulation */
+        arm_neon_state64_t neon_state;
+        mach_msg_type_number_t neon_count = ARM_NEON_STATE64_COUNT;
+        int have_neon = (thread_get_state(thread, ARM_NEON_STATE64,
+                                          (thread_state_t)&neon_state, &neon_count) == KERN_SUCCESS);
         if (kr == KERN_SUCCESS)
         {
             uintptr_t fault_addr = (uintptr_t)req->code[1];
@@ -403,8 +408,28 @@ static void *ios_mach_exception_thread( void *arg )
                     }
                     else
                     {
-                        /* Exec fault OUTSIDE JIT pool — try to translate to JIT equivalent. */
+                        /* Exec fault OUTSIDE JIT pool RX — try translations. */
                         void *jit_pc = ios_jit_translate_addr((void *)(uintptr_t)fault_pc);
+                        if (jit_pc == (void *)(uintptr_t)fault_pc)
+                        {
+                            /* iOS-Mythic: if PC is in JIT pool RW alias range,
+                             * redirect to RX alias (= PC - pool_size). FEX's
+                             * emitted code lives at RX alias addresses, but
+                             * sometimes a BR/BLR computes the RW alias via
+                             * emitter math when our redirect interacts with
+                             * vm_remap. */
+                            extern void *ios_jit_rw_base_global;
+                            extern size_t ios_jit_pool_size_global;
+                            uintptr_t rw_base = (uintptr_t)ios_jit_rw_base_global;
+                            uintptr_t rx_base2 = (uintptr_t)ios_jit_rx_base_global;
+                            if (rw_base && rx_base2 && ios_jit_pool_size_global &&
+                                fault_pc >= rw_base &&
+                                fault_pc < rw_base + ios_jit_pool_size_global)
+                            {
+                                uintptr_t rx_pc = (uintptr_t)fault_pc - rw_base + rx_base2;
+                                jit_pc = (void *)rx_pc;
+                            }
+                        }
                         if (jit_pc == (void *)(uintptr_t)fault_pc)
                         {
                             /* Not a known PE-image translation. Try the anon-alias
@@ -487,8 +512,25 @@ static void *ios_mach_exception_thread( void *arg )
                 {
                     uint32_t insn = *(uint32_t *)(uintptr_t)fault_pc;
                     int emulated = 0;
+                    /* STP (SIMD&FP, signed offset, 128-bit Q): 10 101 1 1 0 0 0 imm7 Rt2 Rn Rt
+                     *   pattern bits 31-22: 10 1011 1000  → top10 = 0x2B8 (= bits 31..22)
+                     *   So mask 0xFFC00000 = top10. Match 0x2B8 << 22 = 0xAE000000? Hmm.
+                     * Actually: STP q0,q1,[xn,#imm] is `1010 1101 0010 ... `
+                     * STP q,q (signed offset): 0xAD0 (top 12), so mask 0xFFE00000 == 0xAD000000.
+                     * STP q,q (pre/post-index variants): 0xAD8, 0xACC, etc.
+                     * For now, emulate the family: top 7 bits = 0b1010110, bit 31:25 = 0x56,
+                     * mask 0xFE000000 matches 0xAC000000 — covers 64/128-bit SIMD STP variants. */
+                    if (have_neon && ((insn & 0xFEC00000) == 0xAC000000 || (insn & 0xFEC00000) == 0xAD000000))
+                    {
+                        /* SIMD STP variants — store 2x 128-bit registers */
+                        int rt = insn & 0x1f;
+                        int rt2 = (insn >> 10) & 0x1f;
+                        memcpy((void *)rw_addr, &neon_state.__v[rt], 16);
+                        memcpy((void *)(rw_addr + 16), &neon_state.__v[rt2], 16);
+                        emulated = 1;
+                    }
                     /* STR (immediate, unsigned offset, 64-bit): 1111 1001 00 imm12 Rn Rt */
-                    if ((insn & 0xffc00000) == 0xf9000000)
+                    else if ((insn & 0xffc00000) == 0xf9000000)
                     {
                         int rt = insn & 0x1f;
                         *(uint64_t *)rw_addr = state.__x[rt];
@@ -601,9 +643,20 @@ static void *ios_mach_exception_thread( void *arg )
                 if (cnt <= 5 || (cnt % 100) == 0)
                 {
                     uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
-                    dprintf(STDERR_FILENO, "[mach_exc] UNHANDLED #%d pc=%p addr=%p x18=%p type=%d\n",
+                    dprintf(STDERR_FILENO, "[mach_exc] UNHANDLED #%d pc=%p addr=%p x18=%p type=%d lr=%p sp=%p x16=%p x17=%p\n",
                         cnt, (void*)(uintptr_t)fault_pc, (void*)fault_addr,
-                        (void*)(uintptr_t)state.__x[18], req->exception);
+                        (void*)(uintptr_t)state.__x[18], req->exception,
+                        (void*)(uintptr_t)state.__lr,
+                        (void*)(uintptr_t)__darwin_arm_thread_state64_get_sp(state),
+                        (void*)(uintptr_t)state.__x[16],
+                        (void*)(uintptr_t)state.__x[17]);
+                    /* Read instruction at LR-4 to identify the BL/BLR */
+                    if (cnt <= 3 && (uintptr_t)state.__lr >= 0x100000000ULL)
+                    {
+                        uint32_t *lr_p = (uint32_t*)(uintptr_t)(state.__lr - 4);
+                        dprintf(STDERR_FILENO, "[mach_exc] caller_insn @lr-4=0x%p: 0x%08x\n",
+                            (void*)lr_p, *lr_p);
+                    }
                     if ((uintptr_t)fault_pc >= 0x100000000ULL)
                     {
                         uint32_t *p = (uint32_t*)(uintptr_t)fault_pc;
