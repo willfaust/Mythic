@@ -171,8 +171,12 @@ JITRegion *jit_region_create(size_t size) {
         mem_entry,
         0,  // offset
         FALSE,  // copy
-        VM_PROT_READ | VM_PROT_EXECUTE,    // current protection
-        VM_PROT_READ | VM_PROT_EXECUTE,    // max protection
+        VM_PROT_READ | VM_PROT_EXECUTE,                  // current protection
+        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,  // max protection
+        // Wider max so vm_protect can grant temporary W (e.g. FEX
+        // PatchCallChecker writes to its __ImageBase + RVA, which lands
+        // on the RX alias). vm_protect+VM_PROT_COPY then COW-flips the
+        // page R/W. W^X still enforced via the actual current protection.
         VM_INHERIT_DEFAULT
     );
 

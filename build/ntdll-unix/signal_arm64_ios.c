@@ -444,9 +444,109 @@ static void *ios_mach_exception_thread( void *arg )
                 }
             }
 
+            /* 4. Emulate stores to JIT-pool RX aliases by redirecting them
+             * to the corresponding JIT-pool RW alias address. iOS dual-map
+             * blocks W on the RX side even with vm_protect+VM_PROT_COPY,
+             * so STR/STP instructions whose target lands in JIT-pool RX
+             * have to be emulated. The instruction's other side-effects
+             * (Rt unchanged, no flag updates) are nil for STR/STP/STRB/STRH. */
+            if (!handled)
+            {
+                extern void *ios_jit_rx_base_global;
+                extern void *ios_jit_rw_base_global;
+                extern size_t ios_jit_pool_size_global;
+                uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
+                uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
+                size_t sz = ios_jit_pool_size_global;
+                uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
+                if (rx && rw && sz &&
+                    fault_addr >= rx && fault_addr < rx + sz &&
+                    (uintptr_t)fault_pc >= 0x100000000ULL)
+                {
+                    uint32_t insn = *(uint32_t *)(uintptr_t)fault_pc;
+                    uintptr_t rw_addr = rw + (fault_addr - rx);
+                    int emulated = 0;
+                    /* STR (immediate, unsigned offset, 64-bit): 1111 1001 00 imm12 Rn Rt */
+                    if ((insn & 0xffc00000) == 0xf9000000)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint64_t *)rw_addr = state.__x[rt];
+                        emulated = 1;
+                    }
+                    /* STR (immediate, unsigned offset, 32-bit): 1011 1001 00 imm12 Rn Rt */
+                    else if ((insn & 0xffc00000) == 0xb9000000)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint32_t *)rw_addr = (uint32_t)state.__x[rt];
+                        emulated = 1;
+                    }
+                    /* STP (signed offset, 64-bit): 10101001 00 imm7 Rt2 Rn Rt */
+                    else if ((insn & 0xffc00000) == 0xa9000000)
+                    {
+                        int rt = insn & 0x1f;
+                        int rt2 = (insn >> 10) & 0x1f;
+                        *(uint64_t *)rw_addr = state.__x[rt];
+                        *(uint64_t *)(rw_addr + 8) = state.__x[rt2];
+                        emulated = 1;
+                    }
+                    /* STR (register, 64-bit): 1111 1000 001 Rm option S 10 Rn Rt */
+                    else if ((insn & 0xffe00c00) == 0xf8200800)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint64_t *)rw_addr = state.__x[rt];
+                        emulated = 1;
+                    }
+                    if (emulated)
+                    {
+                        /* Advance PC past the emulated instruction */
+                        __darwin_arm_thread_state64_set_pc_fptr(state,
+                            (void *)(uintptr_t)(fault_pc + 4));
+                        handled = 1;
+                        static volatile int emul_count = 0;
+                        int ec = __sync_add_and_fetch(&emul_count, 1);
+                        if (ec <= 5 || (ec % 1000) == 0)
+                        {
+                            /* Verify dual-map sharing: read back via the RX
+                             * (original) address and compare to what we wrote
+                             * via RW. If they match, the dual-map is working
+                             * end-to-end. */
+                            uint64_t rw_val = *(uint64_t *)rw_addr;
+                            uint64_t rx_val = *(uint64_t *)fault_addr;
+                            dprintf(STDERR_FILENO,
+                                "[mach_exc] EMULATED STR #%d pc=%p insn=%08x rx=%p→rw=%p"
+                                " | dual-map readback rx=%llx rw=%llx %s\n",
+                                ec, (void*)(uintptr_t)fault_pc, insn,
+                                (void*)fault_addr, (void*)rw_addr,
+                                (unsigned long long)rx_val,
+                                (unsigned long long)rw_val,
+                                (rx_val == rw_val) ? "OK" : "MISMATCH");
+                        }
+                    }
+                }
+            }
+
             if (handled)
                 thread_set_state( thread, ARM_THREAD_STATE64,
                                   (thread_state_t)&state, count );
+            else
+            {
+                /* Rate-limit: log first 5 unhandled faults then every 100th */
+                static volatile int unhandled_count = 0;
+                int cnt = __sync_add_and_fetch(&unhandled_count, 1);
+                if (cnt <= 5 || (cnt % 100) == 0)
+                {
+                    uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
+                    dprintf(STDERR_FILENO, "[mach_exc] UNHANDLED #%d pc=%p addr=%p x18=%p type=%d\n",
+                        cnt, (void*)(uintptr_t)fault_pc, (void*)fault_addr,
+                        (void*)(uintptr_t)state.__x[18], req->exception);
+                    if ((uintptr_t)fault_pc >= 0x100000000ULL)
+                    {
+                        uint32_t *p = (uint32_t*)(uintptr_t)fault_pc;
+                        dprintf(STDERR_FILENO, "[mach_exc] insn_stream PC-12..PC+8: %08x %08x %08x [%08x] %08x %08x %08x\n",
+                            p[-3], p[-2], p[-1], p[0], p[1], p[2], p[3]);
+                    }
+                }
+            }
         }
 
         /* Build reply */
@@ -1580,7 +1680,11 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                 (void*)FP_sig(context), (void*)REGn_sig(30, context),
                 (void*)SP_sig(context));
             if ((uintptr_t)PC_sig(context) >= 0x100000000ULL)
-                ERR("  insn=0x%08x\n", *(uint32_t*)(uintptr_t)PC_sig(context));
+            {
+                uint32_t *p = (uint32_t*)(uintptr_t)PC_sig(context);
+                ERR("  insn_stream PC-12..PC+8: %08x %08x %08x [%08x] %08x %08x %08x\n",
+                    p[-3], p[-2], p[-1], p[0], p[1], p[2], p[3]);
+            }
             else
                 ERR("  insn=<unmappable PC, skipping read>\n");
             /* For tiny PC SEGVs through arm64x_check_call: probe LR-4 to

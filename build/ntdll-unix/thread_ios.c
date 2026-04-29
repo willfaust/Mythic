@@ -1274,6 +1274,9 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
     teb->Tib.StackBase = stack.StackBase;
     teb->Tib.StackLimit = stack.StackLimit;
     teb->DeallocationStack = stack.DeallocationStack;
+    ERR("iOS native stack: TEB %p StackBase=%p StackLimit=%p DeallocStack=%p (reserve=0x%lx commit=0x%lx)\n",
+        teb, stack.StackBase, stack.StackLimit, stack.DeallocationStack,
+        (unsigned long)reserve_size, (unsigned long)commit_size);
     return STATUS_SUCCESS;
 }
 

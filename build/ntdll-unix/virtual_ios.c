@@ -6637,9 +6637,21 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
     DWORD old;
 
 #ifdef WINE_IOS
+    LPVOID ios_jit_orig_addr = NULL;  /* JIT pool RX addr if caller passed one */
     {
         LPVOID orig_addr = addr;
-        addr = (LPVOID)ios_jit_reverse_translate_addr(addr);
+        LPVOID reversed = (LPVOID)ios_jit_reverse_translate_addr(addr);
+        if (reversed != orig_addr)
+        {
+            /* Caller passed a JIT-pool RX address. Translate to parent for the
+             * Wine-side protection update, but remember the original so we can
+             * also flip the JIT-pool RX page's posix prot — otherwise a write
+             * via the JIT-pool RX address (e.g. FEX's PatchCallChecker writing
+             * to its own __ImageBase + RVA) faults because the RX side stays
+             * read-only even after the parent becomes RW. */
+            ios_jit_orig_addr = orig_addr;
+            addr = reversed;
+        }
         ERR("NtProtectVirtualMemory(orig=%p reversed=%p sz=0x%lx prot=0x%x)\n",
             orig_addr, addr, (unsigned long)*size_ptr, new_prot);
     }
@@ -6715,6 +6727,14 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
         *old_prot = old;
 
 #ifdef WINE_IOS
+        /* (Previously: also called mprotect_exec on the JIT-pool RX side
+         * here, but that uses vm_protect+VM_PROT_COPY which makes the page
+         * PRIVATE — breaking the dual-map sharing with the RW alias. We rely
+         * on the Mach SEGV handler's STR emulation instead: stores to JIT-RX
+         * are detected and redirected to the RW alias. Writes via RW alias
+         * remain visible to subsequent reads via the RX alias because the
+         * dual-mapping is preserved.) */
+
         /* After import resolution: PE loader makes IAT writable, fills it, then
          * restores protection. When write access is removed from a JIT-mapped region,
          * sync the data from original PE to JIT pool and translate function pointers.
