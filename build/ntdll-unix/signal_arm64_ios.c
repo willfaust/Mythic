@@ -2202,6 +2202,75 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 #ifdef WINE_IOS
     ios_track_signal( signal, context );
     ERR("ILL at pc=%p\n", (void*)PC_sig(context));
+    {
+        /* iOS-Mythic diagnostic: when we ILL on a zero/empty page, dump full
+         * register state + walk back FP chain to find who BR'd here. */
+        uint64_t pc  = (uint64_t)PC_sig(context);
+        uint64_t lr  = (uint64_t)REGn_sig(30, context);
+        uint64_t fp  = (uint64_t)REGn_sig(29, context);
+        uint64_t sp  = (uint64_t)arm_thread_state64_get_sp(context->uc_mcontext->__ss);
+        uint64_t x0  = (uint64_t)REGn_sig(0,  context);
+        uint64_t x9  = (uint64_t)REGn_sig(9,  context);
+        uint64_t x16 = (uint64_t)REGn_sig(16, context);
+        uint64_t x17 = (uint64_t)REGn_sig(17, context);
+        uint64_t x18 = (uint64_t)REGn_sig(18, context);
+        uint64_t x19 = (uint64_t)REGn_sig(19, context);
+        ERR("ILL diag: pc=0x%llx lr=0x%llx fp=0x%llx sp=0x%llx\n",
+            (unsigned long long)pc, (unsigned long long)lr,
+            (unsigned long long)fp, (unsigned long long)sp);
+        ERR("ILL diag: x0=0x%llx x9=0x%llx x16=0x%llx x17=0x%llx x18=0x%llx x19=0x%llx\n",
+            (unsigned long long)x0, (unsigned long long)x9,
+            (unsigned long long)x16, (unsigned long long)x17,
+            (unsigned long long)x18, (unsigned long long)x19);
+        /* Decode caller_insn at LR-4 (the BL/BLR that brought us here) */
+        if (lr >= 0x100000000ULL && lr < 0x800000000ULL) {
+            vm_size_t outsz = 4;
+            uint32_t caller_insn = 0;
+            if (vm_read_overwrite(mach_task_self(), lr - 4, 4,
+                                  (vm_address_t)&caller_insn, &outsz) == KERN_SUCCESS)
+                ERR("ILL diag: caller_insn @lr-4 = 0x%08x\n", caller_insn);
+        }
+        /* Walk back FP chain (each frame: fp[0]=prev_fp, fp[1]=saved_lr) */
+        for (int frame = 0; frame < 8 && fp >= 0x100000000ULL && fp < 0x800000000ULL; frame++) {
+            vm_size_t outsz = 8;
+            uint64_t prev_fp = 0, saved_lr = 0;
+            if (vm_read_overwrite(mach_task_self(), fp,     8, (vm_address_t)&prev_fp,  &outsz) != KERN_SUCCESS) break;
+            outsz = 8;
+            if (vm_read_overwrite(mach_task_self(), fp + 8, 8, (vm_address_t)&saved_lr, &outsz) != KERN_SUCCESS) break;
+            ERR("ILL diag: frame[%d] fp=0x%llx saved_lr=0x%llx\n",
+                frame, (unsigned long long)fp, (unsigned long long)saved_lr);
+            if (prev_fp <= fp) break;
+            fp = prev_fp;
+        }
+        /* iOS-Mythic: also dump JIT pool here (the Mach UNHANDLED path may not
+         * fire for ILL since we deliver via setup_exception). One-shot. */
+        {
+            static volatile int ill_dumped = 0;
+            if (__sync_bool_compare_and_swap(&ill_dumped, 0, 1)) {
+                extern void *ios_jit_rw_base_global;
+                extern size_t ios_jit_pool_size_global;
+                if (ios_jit_rw_base_global && ios_jit_pool_size_global) {
+                    const char *docs = getenv("MYTHIC_DOCS_DIR");
+                    char path[512];
+                    if (docs) snprintf(path, sizeof(path), "%s/fex-jit-dump.bin", docs);
+                    else      snprintf(path, sizeof(path), "/tmp/fex-jit-dump.bin");
+                    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                    if (fd >= 0) {
+                        ssize_t off = 0;
+                        size_t total = ios_jit_pool_size_global;
+                        while ((size_t)off < total) {
+                            ssize_t n = write(fd, (char*)ios_jit_rw_base_global + off,
+                                              total - off > 0x10000 ? 0x10000 : total - off);
+                            if (n <= 0) break;
+                            off += n;
+                        }
+                        close(fd);
+                        ERR("ILL diag: DUMPED JIT pool RW alias (%zd bytes) to %s\n", off, path);
+                    }
+                }
+            }
+        }
+    }
 #endif
 
     if (!(PSTATE_sig( context ) & 0x10) && /* AArch64 (not WoW) */

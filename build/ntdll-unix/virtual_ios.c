@@ -6863,20 +6863,15 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
             void *jit_rw = (char *)ios_jit_rw_base_global + pool_tail_off;
             *ret = jit_rx;
             *size_ptr = alloc_size;
-            /* Mark as ARM64EC range so arm64x_check_call dispatches correctly. */
-            extern struct file_view *arm64ec_view;
-            if (arm64ec_view)
-            {
-                /* iOS-Mythic: 4KB-page indexing per arm64x_check_call ABI */
-                size_t bm_start = ((size_t)jit_rx >> 12) / 8;
-                size_t bm_end   = (((size_t)jit_rx + alloc_size) >> 12) / 8;
-                size_t bm_size  = ROUND_SIZE(bm_start, bm_end + 1 - bm_start, page_mask);
-                void *bm_page   = ROUND_ADDR((char *)arm64ec_view->base + bm_start, page_mask);
-                set_vprot(arm64ec_view, bm_page, bm_size,
-                          VPROT_READ | VPROT_WRITE | VPROT_COMMITTED);
-                set_arm64ec_range(jit_rx, alloc_size);
-            }
-            ERR("NtAllocateVirtualMemoryEx iOS: redirected EC_CODE %zu bytes to JIT pool tail rx=%p rw=%p\n",
+            /* iOS-Mythic: do NOT call set_arm64ec_range here. FEX's CodeBuffer
+             * holds compiled-from-x86 host ARM64 blocks, not ARM64EC PE code.
+             * Marking it as EC causes the dispatcher's loop-top EC bitmap
+             * check (which tests the GUEST RIP) to falsely route into ExitFunctionEC
+             * and BR x9 directly into the (uninitialized) CodeBuffer when guest
+             * RIP coincidentally lands here, producing UDF #0 faults.
+             * Entry into the CodeBuffer is via FEX's own dispatcher BR, not via
+             * arm64x_check_call, so EC marking is unneeded. */
+            ERR("NtAllocateVirtualMemoryEx iOS: redirected EC_CODE %zu bytes to JIT pool tail rx=%p rw=%p (NOT marked EC: FEX block cache)\n",
                 alloc_size, jit_rx, jit_rw);
             return STATUS_SUCCESS;
         }
