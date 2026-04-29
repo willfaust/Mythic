@@ -610,6 +610,47 @@ static void *ios_mach_exception_thread( void *arg )
                         dprintf(STDERR_FILENO, "[mach_exc] insn_stream PC-12..PC+8: %08x %08x %08x [%08x] %08x %08x %08x\n",
                             p[-3], p[-2], p[-1], p[0], p[1], p[2], p[3]);
                     }
+                    /* One-shot dump: on the first UNHANDLED exec fault, dump the
+                     * JIT-pool RW alias contents around the relevant FEX CodeBuffer
+                     * slots to a file. Lets us disassemble FEX-emitted ARM64 offline
+                     * to verify codegen correctness independently. */
+                    static volatile int dumped = 0;
+                    if (cnt == 1 && __sync_bool_compare_and_swap(&dumped, 0, 1))
+                    {
+                        extern void *ios_jit_rw_base_global;
+                        extern size_t ios_jit_pool_size_global;
+                        if (ios_jit_rw_base_global && ios_jit_pool_size_global)
+                        {
+                            const char *docs = getenv("MYTHIC_DOCS_DIR");
+                            char path[512];
+                            if (docs)
+                                snprintf(path, sizeof(path), "%s/fex-jit-dump.bin", docs);
+                            else
+                                snprintf(path, sizeof(path), "/tmp/fex-jit-dump.bin");
+                            int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                            if (fd >= 0)
+                            {
+                                /* Dump the entire JIT pool RW alias. ~128MB but
+                                 * mostly zero. Compresses well; helpful to scan
+                                 * any populated region. */
+                                ssize_t off = 0;
+                                size_t total = ios_jit_pool_size_global;
+                                while ((size_t)off < total)
+                                {
+                                    ssize_t n = write(fd, (char*)ios_jit_rw_base_global + off,
+                                                       total - off > 0x10000 ? 0x10000 : total - off);
+                                    if (n <= 0) break;
+                                    off += n;
+                                }
+                                close(fd);
+                                dprintf(STDERR_FILENO, "[mach_exc] DUMPED JIT pool RW alias (%zd bytes) to %s\n", off, path);
+                            }
+                            else
+                            {
+                                dprintf(STDERR_FILENO, "[mach_exc] DUMP open failed errno=%d path=%s\n", errno, path);
+                            }
+                        }
+                    }
                     /* Diagnostic: query the kernel for what VM region the fault PC lives in.
                      * Helps identify mystery regions (e.g. JIT pool guard zone, wineserver heap). */
                     if (cnt <= 3)

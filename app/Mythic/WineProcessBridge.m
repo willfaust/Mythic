@@ -107,6 +107,8 @@ static void *wine_process_thread(void *arg) {
             NSString *logPath = [docs stringByAppendingPathComponent:@"mythic-log.txt"];
             wine_log_set_file(logPath.UTF8String);
             LOG("Wine log file: %{public}s", logPath.UTF8String);
+            /* Expose the app Documents dir to Wine code (e.g. for fex-jit-dump.bin) */
+            setenv("MYTHIC_DOCS_DIR", docs.UTF8String, 1);
         }
 
         // Redirect stderr AND stdout to log file so Wine debug output (WINEDEBUG)
