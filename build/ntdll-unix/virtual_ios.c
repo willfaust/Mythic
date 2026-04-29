@@ -215,15 +215,17 @@ void ios_jit_add_mapping(void *pe_base, void *jit_base, size_t size)
     ios_jit_mapping_count++;
 }
 
-/* iOS-Mythic: secondary user_VA → JIT pool RW alias mapping for anonymous
+/* iOS-Mythic: secondary user_VA → JIT pool aliases mapping for anonymous
  * RWX regions (e.g. FEX CodeBuffer). When user_VA is vm_remap'd from JIT pool
- * RX, writes via user_VA fault and the STR fault emulator looks up the
- * corresponding RW alias address here to perform the store. */
+ * RX, writes via user_VA fault and the STR fault emulator looks up the RW
+ * alias here. Execution faults at user_VA are redirected to the RX alias
+ * (which is the only address that's actually executable on iOS TXM). */
 #define IOS_JIT_MAX_ANON_ALIASES 32
 struct ios_jit_anon_alias {
     uintptr_t user_va;
     uintptr_t user_va_end;
     uintptr_t jit_rw_alias;
+    uintptr_t jit_rx_alias;
 };
 static struct ios_jit_anon_alias ios_jit_anon_aliases[IOS_JIT_MAX_ANON_ALIASES];
 static volatile int ios_jit_anon_alias_count = 0;
@@ -238,6 +240,19 @@ void ios_jit_anon_alias_add(void *user_va, size_t size, void *jit_rw_alias)
     ios_jit_anon_aliases[idx].user_va = (uintptr_t)user_va;
     ios_jit_anon_aliases[idx].user_va_end = (uintptr_t)user_va + size;
     ios_jit_anon_aliases[idx].jit_rw_alias = (uintptr_t)jit_rw_alias;
+    ios_jit_anon_aliases[idx].jit_rx_alias = 0;  /* set via _set_rx */
+}
+
+void ios_jit_anon_alias_set_rx(void *user_va, void *jit_rx_alias)
+{
+    int n = ios_jit_anon_alias_count;
+    int i;
+    for (i = 0; i < n; i++) {
+        if ((uintptr_t)user_va == ios_jit_anon_aliases[i].user_va) {
+            ios_jit_anon_aliases[i].jit_rx_alias = (uintptr_t)jit_rx_alias;
+            return;
+        }
+    }
 }
 
 uintptr_t ios_jit_anon_alias_lookup(uintptr_t fault_addr)
@@ -248,6 +263,21 @@ uintptr_t ios_jit_anon_alias_lookup(uintptr_t fault_addr)
         if (fault_addr >= ios_jit_anon_aliases[i].user_va &&
             fault_addr <  ios_jit_anon_aliases[i].user_va_end) {
             return ios_jit_anon_aliases[i].jit_rw_alias +
+                   (fault_addr - ios_jit_anon_aliases[i].user_va);
+        }
+    }
+    return 0;
+}
+
+uintptr_t ios_jit_anon_alias_lookup_rx(uintptr_t fault_addr)
+{
+    int n = ios_jit_anon_alias_count;
+    int i;
+    for (i = 0; i < n; i++) {
+        if (fault_addr >= ios_jit_anon_aliases[i].user_va &&
+            fault_addr <  ios_jit_anon_aliases[i].user_va_end) {
+            if (!ios_jit_anon_aliases[i].jit_rx_alias) return 0;
+            return ios_jit_anon_aliases[i].jit_rx_alias +
                    (fault_addr - ios_jit_anon_aliases[i].user_va);
         }
     }
@@ -2648,8 +2678,30 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
             jit_pool_init_done = 1;
         }
 
-        /* Try normal mprotect first (works on non-TXM devices) */
-        if (!mprotect( base, size, unix_prot )) return 0;
+        /* Try normal mprotect first (works on non-TXM devices). On iOS TXM,
+         * mprotect with PROT_EXEC may *appear* to succeed (return 0) without
+         * actually granting EXEC — pages stay RW only. Verify by querying the
+         * actual page protection via Mach vm_region_64; only return early if
+         * EXEC was truly granted. */
+        if (!mprotect( base, size, unix_prot ))
+        {
+            mach_vm_address_t addr = (mach_vm_address_t)base;
+            mach_vm_size_t reg_size = 0;
+            vm_region_basic_info_data_64_t info;
+            mach_msg_type_number_t info_cnt = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t obj_name = MACH_PORT_NULL;
+            kern_return_t qkr = mach_vm_region(mach_task_self(), &addr, &reg_size,
+                                               VM_REGION_BASIC_INFO_64,
+                                               (vm_region_info_t)&info,
+                                               &info_cnt, &obj_name);
+            if (qkr == KERN_SUCCESS && (info.protection & VM_PROT_EXECUTE))
+            {
+                return 0;  /* genuinely RX/RWX — done */
+            }
+            ERR("iOS mprotect(rwx) appeared to succeed but EXEC not actually granted "
+                "at %p+0x%lx (qkr=%d prot=0x%x); falling through to JIT-pool path\n",
+                base, (unsigned long)size, qkr, qkr == KERN_SUCCESS ? info.protection : -1);
+        }
 
         if (!jit_rx_base || !jit_rw_base)
         {
@@ -2700,9 +2752,30 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 }
             }
 
-            /* Scan backward to find MZ header (PE image start) */
-            for (scan = (char *)((uintptr_t)base & ~0x3FFFUL); scan > (char *)0x10000; scan -= 0x4000)
+            /* Scan backward to find MZ header (PE image start). Bound the
+             * scan to a reasonable distance (max 64MB) so anonymous RWX
+             * regions don't trigger long backward walks into unmapped memory.
+             * Also probe each candidate page via mach_vm_region first to
+             * confirm it's mapped before dereferencing. */
+            char *scan_limit = (char *)((uintptr_t)base - 0x4000000);  /* 64MB */
+            if (scan_limit < (char *)0x10000) scan_limit = (char *)0x10000;
+            for (scan = (char *)((uintptr_t)base & ~0x3FFFUL); scan > scan_limit; scan -= 0x4000)
             {
+                /* Probe page via mach_vm_region to skip unmapped gaps */
+                {
+                    mach_vm_address_t qa = (mach_vm_address_t)scan;
+                    mach_vm_size_t qs = 0;
+                    vm_region_basic_info_data_64_t qinfo;
+                    mach_msg_type_number_t qcnt = VM_REGION_BASIC_INFO_COUNT_64;
+                    mach_port_t qobj = MACH_PORT_NULL;
+                    if (mach_vm_region(mach_task_self(), &qa, &qs,
+                                       VM_REGION_BASIC_INFO_64,
+                                       (vm_region_info_t)&qinfo, &qcnt, &qobj)
+                        != KERN_SUCCESS) break;
+                    /* If mach_vm_region returned a region above scan,
+                     * scan is unmapped — skip ahead to that region's start. */
+                    if ((char *)qa > scan) break;
+                }
                 if (*(unsigned short *)scan == 0x5A4D)  /* MZ */
                 {
                     unsigned int pe_off = *(unsigned int *)(scan + 0x3C);
@@ -2756,6 +2829,21 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     return 0;
                 }
 
+                /* iOS needs an explicit vm_protect to activate EXEC on the
+                 * remapped pages — vm_remap reports cur_prot=R+X in its output
+                 * but the kernel doesn't actually grant exec permission until
+                 * we explicitly request it. */
+                {
+                    kern_return_t pkr = vm_protect(mach_task_self(),
+                        (vm_address_t)base, alloc_size, FALSE,
+                        VM_PROT_READ | VM_PROT_EXECUTE);
+                    if (pkr != KERN_SUCCESS)
+                    {
+                        ERR("iOS JIT: anon RWX vm_protect(R+X) failed kr=%d %p+0x%lx\n",
+                            pkr, base, (unsigned long)alloc_size);
+                    }
+                }
+
                 /* Mark the JIT-pool slot as ARM64EC code so arm64x_check_call
                  * routes correctly (FEX-emitted code is treated as EC for
                  * dispatcher purposes). */
@@ -2771,11 +2859,13 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     set_arm64ec_range(jit_base, alloc_size);
                 }
 
-                /* Record secondary alias for STR fault emulator. */
+                /* Record secondary alias for STR fault emulator and exec PC redirect. */
                 extern void ios_jit_anon_alias_add(void *user_va, size_t size,
                                                    void *jit_rw_alias);
+                extern void ios_jit_anon_alias_set_rx(void *user_va, void *jit_rx_alias);
                 ios_jit_anon_alias_add(base, alloc_size,
                                        (char *)jit_rw_base + offset);
+                ios_jit_anon_alias_set_rx(base, (char *)jit_rx_base + offset);
 
                 ERR("iOS JIT: anon RWX %p+0x%lx → pool offset 0x%lx (rx=%p rw=%p)"
                     " cur_prot=0x%x max_prot=0x%x\n",
@@ -2810,14 +2900,34 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 (unsigned long)offset,
                 (unsigned long)(offset + alloc_size), (unsigned long)jit_pool_size);
 
-            /* Mark the JIT-pool range as ARM64EC code in the EcCodeBitMap.
-             * Without this, PE-side update_arm64ec_ranges only sets bits for
-             * the unix-mapped address range (e.g. 0xebf6a0000+), but code
-             * actually executes from the JIT pool. arm64x_check_call would
-             * then see the JIT-pool target as non-EC and route everything
-             * through ExitToX64 → enter_jit (which needs FEX init).
-             * First commit the bitmap pages backing the JIT-pool range. */
-            if (arm64ec_view)
+            /* Mark the JIT-pool range as ARM64EC code in the EcCodeBitMap —
+             * but ONLY for ARM64EC hybrid PEs. ARM64EC binaries have
+             * Machine=0x8664 (per Microsoft's ABI) just like pure x86_64,
+             * so we can't distinguish via Machine. Use the presence of a
+             * `.hexpthk` section as the discriminator (only ARM64EC PEs
+             * have it). Pure x86_64 PEs (e.g. hello-x64.exe) must NOT be
+             * marked EC because arm64x_check_call would then dispatch BL
+             * directly into the JIT-pool copy of x86_64 instructions
+             * (executed as ARM64 → garbage). Pure x86_64 entries fall
+             * through to the dispatch_call_no_redirect path → xtajit64. */
+            int is_arm64ec_hybrid = 0;
+            {
+                unsigned int pe_o = *(unsigned int *)((char *)jit_rw_base + offset + 0x3C);
+                unsigned short num_s = *(unsigned short *)((char *)jit_rw_base + offset + pe_o + 6);
+                unsigned short opt_s = *(unsigned short *)((char *)jit_rw_base + offset + pe_o + 0x14);
+                char *sec = (char *)jit_rw_base + offset + pe_o + 0x18 + opt_s;
+                int j;
+                for (j = 0; j < num_s; j++, sec += 40)
+                {
+                    if (sec[0] == '.' && sec[1] == 'h' && sec[2] == 'e' && sec[3] == 'x' &&
+                        sec[4] == 'p' && sec[5] == 't' && sec[6] == 'h' && sec[7] == 'k')
+                    {
+                        is_arm64ec_hybrid = 1;
+                        break;
+                    }
+                }
+            }
+            if (arm64ec_view && is_arm64ec_hybrid)
             {
                 char *jit_base = (char *)jit_rx_base + offset;
                 size_t bm_start = ((size_t)jit_base >> page_shift) / 8;
@@ -2827,8 +2937,13 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 set_vprot(arm64ec_view, bm_page, bm_size,
                           VPROT_READ | VPROT_WRITE | VPROT_COMMITTED);
                 set_arm64ec_range(jit_base, image_size);
-                ERR("iOS JIT: set_arm64ec_range(jit %p+0x%lx) bm=%p+0x%lx\n",
+                ERR("iOS JIT: set_arm64ec_range(jit %p+0x%lx) ARM64EC hybrid bm=%p+0x%lx\n",
                     jit_base, (unsigned long)image_size, bm_page, (unsigned long)bm_size);
+            }
+            else
+            {
+                ERR("iOS JIT: NOT marking jit %p+0x%lx as EC (no .hexpthk section, pure x86_64)\n",
+                    (char *)jit_rx_base + offset, (unsigned long)image_size);
             }
 
             /* Make data sections in JIT pool writable by remapping from RW view.

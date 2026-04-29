@@ -405,6 +405,16 @@ static void *ios_mach_exception_thread( void *arg )
                     {
                         /* Exec fault OUTSIDE JIT pool — try to translate to JIT equivalent. */
                         void *jit_pc = ios_jit_translate_addr((void *)(uintptr_t)fault_pc);
+                        if (jit_pc == (void *)(uintptr_t)fault_pc)
+                        {
+                            /* Not a known PE-image translation. Try the anon-alias
+                             * table (FEX CodeBuffer / runtime JIT regions vm_remap'd
+                             * from the JIT pool) — those have a separate RX alias
+                             * that's actually executable. */
+                            extern uintptr_t ios_jit_anon_alias_lookup_rx(uintptr_t);
+                            uintptr_t rx_pc = ios_jit_anon_alias_lookup_rx((uintptr_t)fault_pc);
+                            if (rx_pc) jit_pc = (void *)rx_pc;
+                        }
                         if (jit_pc != (void *)(uintptr_t)fault_pc)
                         {
                             if (thread_teb && state.__x[18] == 0)
