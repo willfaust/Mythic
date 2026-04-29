@@ -595,6 +595,17 @@ static void *ios_mach_exception_thread( void *arg )
                         int rt = insn & 0x1f;
                         *(uint64_t *)rw_addr = state.__x[rt];
                         emulated = 1;
+                        /* Post-index (bits 11:10 = 01) / pre-index (bits 11:10 = 11):
+                         * MUST update Rn += signed imm9. Without this, memcpy-style
+                         * loops would write the same address forever. */
+                        int idx_mode = (insn >> 10) & 3;  // bits 11:10
+                        if (idx_mode == 1 || idx_mode == 3)
+                        {
+                            int rn = (insn >> 5) & 0x1f;
+                            int imm9 = (insn >> 12) & 0x1ff;
+                            if (imm9 & 0x100) imm9 |= ~0x1ff;  // sign-extend 9-bit
+                            state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                        }
                     }
                     /* STR (immediate, post/pre-index, 32-bit): 1011 1000 00 0imm9 0[10]1 Rn Rt */
                     else if ((insn & 0xffe00000) == 0xb8000000 && (insn & 0x800) == 0)
@@ -602,6 +613,137 @@ static void *ios_mach_exception_thread( void *arg )
                         int rt = insn & 0x1f;
                         *(uint32_t *)rw_addr = (uint32_t)state.__x[rt];
                         emulated = 1;
+                        int idx_mode = (insn >> 10) & 3;
+                        if (idx_mode == 1 || idx_mode == 3)
+                        {
+                            int rn = (insn >> 5) & 0x1f;
+                            int imm9 = (insn >> 12) & 0x1ff;
+                            if (imm9 & 0x100) imm9 |= ~0x1ff;
+                            state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                        }
+                    }
+                    /* STRB (immediate, post/pre-index, 8-bit): 0011 1000 00 0imm9 0[10]1 Rn Rt
+                     * Hits when iOS memcpy handles the trailing bytes after the
+                     * 8-byte D-store loop completes (660 bytes = 82*8 + 4 bytes
+                     * tail; the tail is byte-by-byte). */
+                    else if ((insn & 0xffe00000) == 0x38000000 && (insn & 0x800) == 0)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint8_t *)rw_addr = (uint8_t)state.__x[rt];
+                        emulated = 1;
+                        int idx_mode = (insn >> 10) & 3;
+                        if (idx_mode == 1 || idx_mode == 3)
+                        {
+                            int rn = (insn >> 5) & 0x1f;
+                            int imm9 = (insn >> 12) & 0x1ff;
+                            if (imm9 & 0x100) imm9 |= ~0x1ff;
+                            state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                        }
+                    }
+                    /* STRH (immediate, post/pre-index, 16-bit): 0111 1000 00 0imm9 0[10]1 Rn Rt */
+                    else if ((insn & 0xffe00000) == 0x78000000 && (insn & 0x800) == 0)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint16_t *)rw_addr = (uint16_t)state.__x[rt];
+                        emulated = 1;
+                        int idx_mode = (insn >> 10) & 3;
+                        if (idx_mode == 1 || idx_mode == 3)
+                        {
+                            int rn = (insn >> 5) & 0x1f;
+                            int imm9 = (insn >> 12) & 0x1ff;
+                            if (imm9 & 0x100) imm9 |= ~0x1ff;
+                            state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                        }
+                    }
+                    /* SIMD/FP STR (immediate, post/pre-index, D-reg = 64-bit):
+                     * 11 111 1 00 00 0 imm9 idx Rn Rt   — encoding 0xfc000400 base.
+                     * The fc008600 = `str d0, [x16], #8` from iOS memcpy hits
+                     * this when copying compiled FEX blocks to RX-only memory. */
+                    else if ((insn & 0xffe00000) == 0xfc000000 && (insn & 0xc00) != 0)
+                    {
+                        int rt = insn & 0x1f;
+                        if (have_neon)
+                        {
+                            /* Low 64 bits of the 128-bit Q-reg = D-reg. */
+                            memcpy((void *)rw_addr, &neon_state.__v[rt], 8);
+                            emulated = 1;
+                            int idx_mode = (insn >> 10) & 3;
+                            if (idx_mode == 1 || idx_mode == 3)
+                            {
+                                int rn = (insn >> 5) & 0x1f;
+                                int imm9 = (insn >> 12) & 0x1ff;
+                                if (imm9 & 0x100) imm9 |= ~0x1ff;
+                                state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                            }
+                        }
+                    }
+                    /* SIMD/FP STR (immediate, post/pre-index, S-reg = 32-bit):
+                     * 10 111 1 00 00 0 imm9 idx Rn Rt   — base 0xbc000400. */
+                    else if ((insn & 0xffe00000) == 0xbc000000 && (insn & 0xc00) != 0)
+                    {
+                        int rt = insn & 0x1f;
+                        if (have_neon)
+                        {
+                            memcpy((void *)rw_addr, &neon_state.__v[rt], 4);
+                            emulated = 1;
+                            int idx_mode = (insn >> 10) & 3;
+                            if (idx_mode == 1 || idx_mode == 3)
+                            {
+                                int rn = (insn >> 5) & 0x1f;
+                                int imm9 = (insn >> 12) & 0x1ff;
+                                if (imm9 & 0x100) imm9 |= ~0x1ff;
+                                state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                            }
+                        }
+                    }
+                    /* SIMD/FP STR (immediate, post/pre-index, Q-reg = 128-bit):
+                     * 00 111 1 00 10 0 imm9 idx Rn Rt   — base 0x3c800400. */
+                    else if ((insn & 0xffe00000) == 0x3c800000 && (insn & 0xc00) != 0)
+                    {
+                        int rt = insn & 0x1f;
+                        if (have_neon)
+                        {
+                            memcpy((void *)rw_addr, &neon_state.__v[rt], 16);
+                            emulated = 1;
+                            int idx_mode = (insn >> 10) & 3;
+                            if (idx_mode == 1 || idx_mode == 3)
+                            {
+                                int rn = (insn >> 5) & 0x1f;
+                                int imm9 = (insn >> 12) & 0x1ff;
+                                if (imm9 & 0x100) imm9 |= ~0x1ff;
+                                state.__x[rn] = (uint64_t)((int64_t)state.__x[rn] + imm9);
+                            }
+                        }
+                    }
+                    /* SIMD/FP STR (immediate, unsigned offset, D-reg): 11 111 1 01 00 imm12 Rn Rt */
+                    else if ((insn & 0xffc00000) == 0xfd000000)
+                    {
+                        int rt = insn & 0x1f;
+                        if (have_neon)
+                        {
+                            memcpy((void *)rw_addr, &neon_state.__v[rt], 8);
+                            emulated = 1;
+                        }
+                    }
+                    /* SIMD/FP STR (immediate, unsigned offset, S-reg): 10 111 1 01 00 imm12 Rn Rt */
+                    else if ((insn & 0xffc00000) == 0xbd000000)
+                    {
+                        int rt = insn & 0x1f;
+                        if (have_neon)
+                        {
+                            memcpy((void *)rw_addr, &neon_state.__v[rt], 4);
+                            emulated = 1;
+                        }
+                    }
+                    /* SIMD/FP STR (immediate, unsigned offset, Q-reg): 00 111 1 01 10 imm12 Rn Rt */
+                    else if ((insn & 0xffc00000) == 0x3d800000)
+                    {
+                        int rt = insn & 0x1f;
+                        if (have_neon)
+                        {
+                            memcpy((void *)rw_addr, &neon_state.__v[rt], 16);
+                            emulated = 1;
+                        }
                     }
                     if (emulated)
                     {
@@ -724,6 +866,85 @@ static void *ios_mach_exception_thread( void *arg )
                                 qinfo.protection, qinfo.max_protection,
                                 qinfo.inheritance, qinfo.shared,
                                 (unsigned long long)qinfo.offset);
+                        }
+                    }
+
+                    /* iOS-Mythic: dump x86 STATE on the first few faults. FEX rarely
+                     * spills RSP/RSI/RDI etc to State.gregs[] (they live in static
+                     * ARM regs x23/x25/x26 and only get spilled at SpillStaticRegs
+                     * call sites — which most of __dyn_tls_init's path never hits).
+                     * So the LIVE x86 register values are in state.__x[] of the
+                     * faulted thread. FEX static map under ARM64EC:
+                     *   x23 = RSP, x25 = RSI, x26 = RDI, x6 = RAX (per milestone).
+                     * State pointer is reachable via TEB+0x1788 -> CPUArea+0x30.   */
+                    if (cnt <= 3)
+                    {
+                        uintptr_t teb_out = 0;
+                        void *tramp_out = NULL;
+                        ios_lookup_thread(thread, &teb_out, &tramp_out);
+                        void *fex_state = NULL;
+                        if (teb_out)
+                        {
+                            void *cpuarea = *(void**)(teb_out + 0x1788);
+                            if (cpuarea) fex_state = *(void**)((char*)cpuarea + 0x30);
+                        }
+                        uint64_t state_rip = fex_state ? ((uint64_t*)fex_state)[0x18 / 8] : 0;
+                        uint64_t state_cret = fex_state ? ((uint64_t*)fex_state)[0xb0 / 8] : 0;
+
+                        /* LIVE x86 regs from host ARM thread state. */
+                        uint64_t live_rsp = state.__x[23];
+                        uint64_t live_rsi = state.__x[25];
+                        uint64_t live_rdi = state.__x[26];
+                        uint64_t live_rax = state.__x[6];
+                        dprintf(STDERR_FILENO,
+                            "[x86_live] RSP=0x%llx RSI=0x%llx RDI=0x%llx RAX=0x%llx | State.RIP=0x%llx callret_sp=0x%llx\n",
+                            (unsigned long long)live_rsp, (unsigned long long)live_rsi,
+                            (unsigned long long)live_rdi, (unsigned long long)live_rax,
+                            (unsigned long long)state_rip, (unsigned long long)state_cret);
+
+                        if (live_rsp >= 0x10000 && live_rsp < 0xfffffff000000000ULL)
+                        {
+                            uint64_t buf[16];
+                            mach_vm_size_t got = 0;
+                            kern_return_t kr = mach_vm_read_overwrite(
+                                mach_task_self(),
+                                (mach_vm_address_t)(live_rsp - 32),
+                                sizeof(buf),
+                                (mach_vm_address_t)buf, &got);
+                            if (kr == KERN_SUCCESS && got >= 64)
+                            {
+                                dprintf(STDERR_FILENO,
+                                    "[x86_stk] @RSP-32..-8: %016llx %016llx %016llx %016llx  (last = popped slot)\n",
+                                    (unsigned long long)buf[0],
+                                    (unsigned long long)buf[1],
+                                    (unsigned long long)buf[2],
+                                    (unsigned long long)buf[3]);
+                                dprintf(STDERR_FILENO,
+                                    "[x86_stk] @RSP+0..+24:  %016llx %016llx %016llx %016llx\n",
+                                    (unsigned long long)buf[4],
+                                    (unsigned long long)buf[5],
+                                    (unsigned long long)buf[6],
+                                    (unsigned long long)buf[7]);
+                                dprintf(STDERR_FILENO,
+                                    "[x86_stk] @RSP+32..+56: %016llx %016llx %016llx %016llx\n",
+                                    (unsigned long long)buf[8],
+                                    (unsigned long long)buf[9],
+                                    (unsigned long long)buf[10],
+                                    (unsigned long long)buf[11]);
+                            }
+                            else
+                            {
+                                dprintf(STDERR_FILENO,
+                                    "[x86_stk] vm_read RSP=0x%llx kr=%d got=%llu\n",
+                                    (unsigned long long)live_rsp, kr,
+                                    (unsigned long long)got);
+                            }
+                        }
+                        else
+                        {
+                            dprintf(STDERR_FILENO,
+                                "[x86_stk] live_rsp=0x%llx out of range — RSP not yet established\n",
+                                (unsigned long long)live_rsp);
                         }
                     }
                 }

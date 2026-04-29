@@ -82,13 +82,55 @@ enum StikJITHelper {
     static func allocatePool(poolSize: Int = 128 * 1024 * 1024) -> (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)? {
         LogStore.shared.log("Allocating \(poolSize / 1024 / 1024)MB JIT pool via debugger...")
 
-        // Ask debugger to allocate RX pages (x0=0 triggers _M allocation)
+        // iOS-Mythic: FEX's dispatcher emit has a position-dependent encoding
+        // bug — only works when the JIT pool lands at a high enough address
+        // (empirically ≥ 0x119000000, so dispatcher at +0x7ffc130 has top byte
+        // 0x12). When iOS allocates 0x114-0x117xxx the dispatcher's literal-
+        // pool fixups silently break and execution branches to zero memory
+        // before the first compiled block runs. Pre-claim ~96MB of low address
+        // space to push the next ANYWHERE allocation up.
+        //
+        // We keep these allocations alive for the lifetime of the process —
+        // freeing them could let iOS reuse them and cause aliasing issues.
+        var pinChunks: [vm_address_t] = []
+        let chunkSize = 16 * 1024 * 1024  // 16 MB per chunk
+        let numChunks = 6                  // 96 MB total
+        for i in 0..<numChunks {
+            var addr: vm_address_t = 0
+            let kr = vm_allocate(mach_task_self_, &addr, vm_size_t(chunkSize), VM_FLAGS_ANYWHERE)
+            if kr == KERN_SUCCESS {
+                pinChunks.append(addr)
+                LogStore.shared.log(String(format: "JIT-pool pin chunk %d at 0x%lx (16MB)", i, Int(addr)))
+            } else {
+                LogStore.shared.log("JIT-pool pin chunk \(i) FAILED kr=\(kr)", level: .error)
+                break
+            }
+        }
+
+        // Ask debugger to allocate RX pages (x0=0 triggers _M allocation).
+        // With pin chunks claimed, this should land at a higher address.
         guard let rxPtr = jit26_prepare_region(nil, poolSize), rxPtr != UnsafeMutableRawPointer(bitPattern: 0) else {
             LogStore.shared.log("Debugger failed to allocate RX memory", level: .error)
             return nil
         }
 
-        LogStore.shared.log("RX pool at \(String(format: "%p", Int(bitPattern: rxPtr)))")
+        let rxAddr = Int(bitPattern: rxPtr)
+        LogStore.shared.log("RX pool at \(String(format: "%p", rxAddr))")
+        // FEX has a position-dependent emit bug at low pool addresses (mode A:
+        // dispatcher branches to zero memory before block 0 ever runs). The
+        // signal_arm64_ios.c init_syscall_frame applies a runtime patch that
+        // fixes the higher-address mode B (SpillStaticRegs literal-pool
+        // corruption), so any pool ≥ 0x119000000 should now work. Below that,
+        // fast-fail to save Wine-init time.
+        let goodLow: Int = 0x119000000
+        if rxAddr < goodLow {
+            LogStore.shared.log("BAD POOL (mode A): 0x\(String(rxAddr, radix: 16)) < 0x\(String(goodLow, radix: 16)). Killing in 10s — please relaunch.", level: .error)
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 10) {
+                LogStore.shared.log("BAD POOL — exiting now. Relaunch the app.", level: .error)
+                exit(0)
+            }
+            return nil
+        }
 
         // Create RW mapping via vm_remap
         var rwAddr: vm_address_t = 0
