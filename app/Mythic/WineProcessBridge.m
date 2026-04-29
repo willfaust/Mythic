@@ -109,13 +109,15 @@ static void *wine_process_thread(void *arg) {
             LOG("Wine log file: %{public}s", logPath.UTF8String);
         }
 
-        // Redirect stderr to log file so Wine debug output (WINEDEBUG) is captured
+        // Redirect stderr AND stdout to log file so Wine debug output (WINEDEBUG)
+        // and the guest program's printf are both captured.
         {
             NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-            NSString *stderrPath = [docs stringByAppendingPathComponent:@"mythic-log.txt"];
-            int logfd = open(stderrPath.UTF8String, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            NSString *logPath2 = [docs stringByAppendingPathComponent:@"mythic-log.txt"];
+            int logfd = open(logPath2.UTF8String, O_WRONLY | O_CREAT | O_APPEND, 0644);
             if (logfd >= 0) {
                 dup2(logfd, STDERR_FILENO);
+                dup2(logfd, STDOUT_FILENO);
                 close(logfd);
             }
         }
