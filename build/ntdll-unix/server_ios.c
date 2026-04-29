@@ -56,11 +56,12 @@ static void wine_log_write(const char *fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
-    /* Always write to os_log */
     char buf[1024];
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    os_log(OS_LOG_DEFAULT, "%{public}s", buf);
+    /* Direct stderr (which is dup2'd to log file) instead of os_log to avoid
+     * potential ObjC dispatch from inside FEX/x18-zero contexts. */
+    dprintf(STDERR_FILENO, "%s\n", buf);
     /* Forward to UI log callback */
     extern void wine_ui_log(const char *message);
     wine_ui_log(buf);
