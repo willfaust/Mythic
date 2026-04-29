@@ -6712,6 +6712,63 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
     if (*ret && (align || limit_low || limit_high)) return STATUS_INVALID_PARAMETER;
     if (!*size_ptr) return STATUS_INVALID_PARAMETER;
 
+#ifdef WINE_IOS
+    /* iOS-Mythic: For FEX-style EC_CODE RWX allocations, allocate from the
+     * JIT pool RX range directly. This avoids the cross-region RIP-relative
+     * addressing problem: when emit_VA == execute_VA (both are the JIT pool
+     * RX alias), ADRP/ADR/B/BL offsets calculated at emit time work correctly
+     * at execution time. iOS won't grant exec on arbitrary user_VA, but the
+     * JIT pool RX alias (mapped via mach_make_memory_entry_64+vm_map) is
+     * genuinely R+X. Writes via STR fault emulation route through the RW
+     * alias at the same offset within the pool.
+     *
+     * Triggered by: NtAllocateVirtualMemoryEx with attrs containing
+     * MEM_EXTENDED_PARAMETER_EC_CODE (0x40) and prot=PAGE_EXECUTE_READWRITE,
+     * caller-supplied address NULL (kernel-pick). */
+    if (process == NtCurrentProcess() &&
+        (attributes & 0x40 /* MEM_EXTENDED_PARAMETER_EC_CODE_FLAG */) &&
+        protect == PAGE_EXECUTE_READWRITE &&
+        *ret == NULL &&
+        ios_jit_rx_base_global && ios_jit_rw_base_global &&
+        ios_jit_pool_size_global)
+    {
+        static volatile size_t ios_jit_alloc_ex_offset = 0;
+        size_t alloc_size = (*size_ptr + 0x3FFF) & ~0x3FFFUL;
+        /* Reserve from the END of the JIT pool to avoid colliding with
+         * mprotect_exec's PE-image copies which take from the start. */
+        size_t reserve_offset = __sync_fetch_and_add(&ios_jit_alloc_ex_offset, alloc_size);
+        size_t pool_tail_off = ios_jit_pool_size_global - reserve_offset - alloc_size;
+        if (reserve_offset + alloc_size > ios_jit_pool_size_global / 2)
+        {
+            ERR("NtAllocateVirtualMemoryEx iOS: JIT-pool tail exhausted for FEX EC_CODE %zu bytes\n",
+                (size_t)*size_ptr);
+            /* Fall through to normal allocation */
+        }
+        else
+        {
+            void *jit_rx = (char *)ios_jit_rx_base_global + pool_tail_off;
+            void *jit_rw = (char *)ios_jit_rw_base_global + pool_tail_off;
+            *ret = jit_rx;
+            *size_ptr = alloc_size;
+            /* Mark as ARM64EC range so arm64x_check_call dispatches correctly. */
+            extern struct file_view *arm64ec_view;
+            if (arm64ec_view)
+            {
+                size_t bm_start = ((size_t)jit_rx >> page_shift) / 8;
+                size_t bm_end   = (((size_t)jit_rx + alloc_size) >> page_shift) / 8;
+                size_t bm_size  = ROUND_SIZE(bm_start, bm_end + 1 - bm_start, page_mask);
+                void *bm_page   = ROUND_ADDR((char *)arm64ec_view->base + bm_start, page_mask);
+                set_vprot(arm64ec_view, bm_page, bm_size,
+                          VPROT_READ | VPROT_WRITE | VPROT_COMMITTED);
+                set_arm64ec_range(jit_rx, alloc_size);
+            }
+            ERR("NtAllocateVirtualMemoryEx iOS: redirected EC_CODE %zu bytes to JIT pool tail rx=%p rw=%p\n",
+                alloc_size, jit_rx, jit_rw);
+            return STATUS_SUCCESS;
+        }
+    }
+#endif
+
     if (process != NtCurrentProcess())
     {
         union apc_call call;
