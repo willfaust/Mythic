@@ -501,6 +501,20 @@ static void *ios_mach_exception_thread( void *arg )
                         *(uint32_t *)rw_addr = (uint32_t)state.__x[rt];
                         emulated = 1;
                     }
+                    /* STRB (immediate, unsigned offset, 8-bit): 0011 1001 00 imm12 Rn Rt */
+                    else if ((insn & 0xffc00000) == 0x39000000)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint8_t *)rw_addr = (uint8_t)state.__x[rt];
+                        emulated = 1;
+                    }
+                    /* STRH (immediate, unsigned offset, 16-bit): 0111 1001 00 imm12 Rn Rt */
+                    else if ((insn & 0xffc00000) == 0x79000000)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint16_t *)rw_addr = (uint16_t)state.__x[rt];
+                        emulated = 1;
+                    }
                     /* STP (signed offset, 64-bit): 10101001 00 imm7 Rt2 Rn Rt */
                     else if ((insn & 0xffc00000) == 0xa9000000)
                     {
@@ -510,11 +524,41 @@ static void *ios_mach_exception_thread( void *arg )
                         *(uint64_t *)(rw_addr + 8) = state.__x[rt2];
                         emulated = 1;
                     }
+                    /* STP (signed offset, 32-bit): 00101001 00 imm7 Rt2 Rn Rt */
+                    else if ((insn & 0xffc00000) == 0x29000000)
+                    {
+                        int rt = insn & 0x1f;
+                        int rt2 = (insn >> 10) & 0x1f;
+                        *(uint32_t *)rw_addr = (uint32_t)state.__x[rt];
+                        *(uint32_t *)(rw_addr + 4) = (uint32_t)state.__x[rt2];
+                        emulated = 1;
+                    }
                     /* STR (register, 64-bit): 1111 1000 001 Rm option S 10 Rn Rt */
                     else if ((insn & 0xffe00c00) == 0xf8200800)
                     {
                         int rt = insn & 0x1f;
                         *(uint64_t *)rw_addr = state.__x[rt];
+                        emulated = 1;
+                    }
+                    /* STR (register, 32-bit): 1011 1000 001 Rm option S 10 Rn Rt */
+                    else if ((insn & 0xffe00c00) == 0xb8200800)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint32_t *)rw_addr = (uint32_t)state.__x[rt];
+                        emulated = 1;
+                    }
+                    /* STR (immediate, post/pre-index, 64-bit): 1111 1000 00 0imm9 0[10]1 Rn Rt */
+                    else if ((insn & 0xffe00000) == 0xf8000000 && (insn & 0x800) == 0)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint64_t *)rw_addr = state.__x[rt];
+                        emulated = 1;
+                    }
+                    /* STR (immediate, post/pre-index, 32-bit): 1011 1000 00 0imm9 0[10]1 Rn Rt */
+                    else if ((insn & 0xffe00000) == 0xb8000000 && (insn & 0x800) == 0)
+                    {
+                        int rt = insn & 0x1f;
+                        *(uint32_t *)rw_addr = (uint32_t)state.__x[rt];
                         emulated = 1;
                     }
                     if (emulated)
@@ -565,6 +609,28 @@ static void *ios_mach_exception_thread( void *arg )
                         uint32_t *p = (uint32_t*)(uintptr_t)fault_pc;
                         dprintf(STDERR_FILENO, "[mach_exc] insn_stream PC-12..PC+8: %08x %08x %08x [%08x] %08x %08x %08x\n",
                             p[-3], p[-2], p[-1], p[0], p[1], p[2], p[3]);
+                    }
+                    /* Diagnostic: query the kernel for what VM region the fault PC lives in.
+                     * Helps identify mystery regions (e.g. JIT pool guard zone, wineserver heap). */
+                    if (cnt <= 3)
+                    {
+                        mach_vm_address_t qa = (mach_vm_address_t)fault_pc;
+                        mach_vm_size_t qs = 0;
+                        vm_region_basic_info_data_64_t qinfo;
+                        mach_msg_type_number_t qcnt = VM_REGION_BASIC_INFO_COUNT_64;
+                        mach_port_t qobj = MACH_PORT_NULL;
+                        if (mach_vm_region(mach_task_self(), &qa, &qs,
+                                           VM_REGION_BASIC_INFO_64,
+                                           (vm_region_info_t)&qinfo, &qcnt, &qobj)
+                            == KERN_SUCCESS)
+                        {
+                            dprintf(STDERR_FILENO,
+                                "[mach_exc] vm_region: addr=0x%llx size=0x%llx prot=0x%x max_prot=0x%x inherit=%d shared=%d offset=0x%llx\n",
+                                (unsigned long long)qa, (unsigned long long)qs,
+                                qinfo.protection, qinfo.max_protection,
+                                qinfo.inheritance, qinfo.shared,
+                                (unsigned long long)qinfo.offset);
+                        }
                     }
                 }
             }
@@ -2214,8 +2280,14 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         extern int ios_jit_addr_is_text(uintptr_t addr);
         extern void *ios_jit_rx_base_global;
         extern size_t ios_jit_pool_size_global;
+        extern uintptr_t ios_jit_anon_alias_lookup_rx(uintptr_t fault_addr);
 
         void *jit_pc = ios_jit_translate_addr(pc);
+        if (jit_pc == pc) {
+            /* Try the anon-alias table (FEX CodeBuffer / runtime JIT) */
+            uintptr_t rx_pc = ios_jit_anon_alias_lookup_rx((uintptr_t)pc);
+            if (rx_pc) jit_pc = (void *)rx_pc;
+        }
         if (jit_pc != pc)
         {
             /* Use trampoline to set x18 (sigreturn zeroes it on iOS) */
