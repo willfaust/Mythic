@@ -1609,6 +1609,63 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                         ERR("    → BLR x%d", rn);
                     }
                     ERR("\n");
+                    /* Dump 4 insns before the BLR — usually ADRP/ADRPL+LDR
+                     * loading x16 from a dispatcher slot. Decode the slot
+                     * address and the pointer it currently contains. */
+                    if (lr_val >= 0x100000010ULL)
+                    {
+                        uint32_t i0 = *(uint32_t*)(lr_val - 16);
+                        uint32_t i1 = *(uint32_t*)(lr_val - 12);
+                        uint32_t i2 = *(uint32_t*)(lr_val - 8);
+                        ERR("  call_site@(lr-16): %08x %08x %08x %08x\n",
+                            i0, i1, i2, branch_insn);
+                        /* Scan i0..i2 for an ADRP and following LDR loading
+                         * x16, the BLR target. */
+                        uint32_t insns[4] = { i0, i1, i2, branch_insn };
+                        uintptr_t insn_pcs[4] = {
+                            lr_val - 16, lr_val - 12, lr_val - 8, lr_val - 4 };
+                        for (int k = 0; k < 3; k++)
+                        {
+                            uint32_t adrp = insns[k];
+                            /* ADRP encoding: 1 | immlo[2] | 10000 | immhi[19] | Rd[5] */
+                            if ((adrp & 0x9f000000) != 0x90000000) continue;
+                            int rd = adrp & 0x1f;
+                            int64_t immhi = (int64_t)((adrp >> 5) & 0x7ffff);
+                            int64_t immlo = (int64_t)((adrp >> 29) & 3);
+                            int64_t imm21 = (immhi << 2) | immlo;
+                            if (imm21 & (1LL << 20)) imm21 |= (int64_t)0xffffffffffe00000;
+                            uintptr_t adrp_pc = insn_pcs[k] & ~0xfffULL;
+                            uintptr_t adrp_target = adrp_pc + (imm21 << 12);
+                            ERR("    ADRP x%d → page %p (insn[%d]=%08x)\n",
+                                rd, (void*)adrp_target, k, adrp);
+                            /* Look for matching LDR in following insns. */
+                            for (int m = k + 1; m < 4; m++)
+                            {
+                                uint32_t ldr = insns[m];
+                                if ((ldr & 0xffc00000) != 0xf9400000) continue;
+                                int rn_ldr = (ldr >> 5) & 0x1f;
+                                int rt_ldr = ldr & 0x1f;
+                                if (rn_ldr != rd) continue;
+                                uint32_t imm12 = (ldr >> 10) & 0xfff;
+                                uintptr_t slot_addr = adrp_target + (imm12 * 8);
+                                ERR("    LDR x%d, [x%d, #0x%x] → slot=%p\n",
+                                    rt_ldr, rn_ldr, imm12 * 8, (void*)slot_addr);
+                                if (slot_addr >= 0x100000000ULL)
+                                {
+                                    void *slot_val = *(void**)slot_addr;
+                                    extern uintptr_t ios_jit_reverse_translate_addr(void *addr);
+                                    uintptr_t parent_slot = ios_jit_reverse_translate_addr((void*)slot_addr);
+                                    void *parent_val = (parent_slot && parent_slot != slot_addr)
+                                        ? *(void**)parent_slot : NULL;
+                                    ERR("    JIT *slot = %p   parent@%p *slot = %p (expected %p)\n",
+                                        slot_val, (void*)parent_slot, parent_val,
+                                        peb ? peb->WerRegistrationData : NULL);
+                                }
+                                break;
+                            }
+                            break;
+                        }
+                    }
                 }
                 if (peb && peb->EcCodeBitMap && x11_at_seg >= 0x100000000ULL)
                 {
@@ -1671,6 +1728,51 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                                 break;
                             }
                         }
+                    }
+                }
+                /* Dump arm64x_check_call's first 8 instructions in JIT pool. We
+                 * are crashing INSIDE that function (BLR x16 at lr-4). Its first
+                 * instruction is `ldr x16, [x18, #0x60]` — the ONE x18-using
+                 * insn in its body. The x18 patcher should have replaced it with
+                 * a B to a trampoline. If the B's target decodes outside the JIT
+                 * pool's trampoline area, that's the bug.
+                 * Address is stashed in peb->WerRegistrationData by Wine's
+                 * arm64ec_process_init. */
+                {
+                    uint32_t *cc = peb ? (uint32_t *)peb->WerRegistrationData : NULL;
+                    if ((uintptr_t)cc >= 0x100000000ULL)
+                    {
+                        ERR("  arm64x_check_call@%p: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                            cc, cc[0], cc[1], cc[2], cc[3], cc[4], cc[5], cc[6], cc[7]);
+                        /* If cc[0] is a B (top 6 bits = 0x05 = 0b000101), decode
+                         * its target and dump the trampoline contents there. */
+                        if ((cc[0] >> 26) == 5)
+                        {
+                            int32_t imm26 = (int32_t)(cc[0] & 0x3FFFFFF);
+                            if (imm26 & 0x2000000) imm26 |= (int32_t)0xFC000000;
+                            intptr_t b_target = (intptr_t)cc + ((intptr_t)imm26 << 2);
+                            ERR("    cc[0] is B → target=%p (delta=%d insns)\n",
+                                (void*)b_target, (int)imm26);
+                            if (b_target >= 0x100000000LL)
+                            {
+                                uint32_t *t = (uint32_t *)b_target;
+                                ERR("    cc-tramp@%p: %08x %08x %08x %08x %08x %08x %08x\n",
+                                    (void*)b_target, t[0], t[1], t[2], t[3], t[4], t[5], t[6]);
+                            }
+                            else
+                            {
+                                ERR("    cc-tramp out of range — B encoding bad\n");
+                            }
+                        }
+                        else
+                        {
+                            ERR("    cc[0] is NOT a B (opcode top6=%d) — patcher missed it\n",
+                                (cc[0] >> 26));
+                        }
+                    }
+                    else
+                    {
+                        ERR("  __os_arm64x_check_call=%p (not set or bad)\n", cc);
                     }
                 }
             }

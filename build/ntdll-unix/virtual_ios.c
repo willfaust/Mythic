@@ -6717,11 +6717,23 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
 #ifdef WINE_IOS
         /* After import resolution: PE loader makes IAT writable, fills it, then
          * restores protection. When write access is removed from a JIT-mapped region,
-         * sync the data from original PE to JIT pool and translate function pointers. */
-        if (!(new_prot & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
-            && (old & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+         * sync the data from original PE to JIT pool and translate function pointers.
+         * Also fires on PAGE_READWRITE → PAGE_WRITECOPY (the pattern Wine's
+         * arm64ec_update_hybrid_metadata uses to restore section protection
+         * after writing dispatcher slots — without this the JIT-pool copy of
+         * the metadata table never sees the SET_FUNC writes). */
+        /* Always sync parent → JIT for any NtProtectVirtualMemory call on a
+         * JIT-mapped region. The old/new comparison can't reliably detect
+         * writes-then-restore patterns because get_win32_prot() reports the
+         * section's allocation prot (PAGE_WRITECOPY for .data) — not the
+         * actual per-page state — so RW→WRITECOPY transitions read as 0x8→0x8.
+         * Over-syncing is OK: parent is always the source of truth. */
+        ERR("iOS NtProtect-sync-check: base=%p sz=0x%lx old=0x%x new=0x%x\n",
+            base, (unsigned long)size, old, new_prot);
+        if (1)
         {
             int idx;
+            ERR("iOS NtProtect-sync: triggered, scanning %d JIT mappings\n", ios_jit_mapping_count);
             for (idx = 0; idx < ios_jit_mapping_count; idx++)
             {
                 uintptr_t pe_start = (uintptr_t)ios_jit_mappings[idx].pe_base;
